@@ -11,7 +11,7 @@ use ethers::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::discovery::Discovery;
@@ -107,7 +107,7 @@ impl BlockchainClient {
 
     /// Query available tasks from TaskRegistry
     pub async fn get_available_tasks(&self) -> Result<Vec<TaskInfo>> {
-        let task_registry = self.task_registry_address
+        let _task_registry = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
         // TODO: Call TaskRegistry.getAvailableTasks()
@@ -116,8 +116,8 @@ impl BlockchainClient {
     }
 
     /// Claim a task
-    pub async fn claim_task(&self, task_id: u64, wallet: &LocalWallet) -> Result<TxHash> {
-        let task_registry = self.task_registry_address
+    pub async fn claim_task(&self, _task_id: u64, _wallet: &LocalWallet) -> Result<TxHash> {
+        let _task_registry = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
         // TODO: Call TaskRegistry.claimTask(taskId)
@@ -128,11 +128,11 @@ impl BlockchainClient {
     /// Submit task result
     pub async fn submit_result(
         &self,
-        task_id: u64,
-        result_hash: [u8; 32],
-        wallet: &LocalWallet,
+        _task_id: u64,
+        _result_hash: [u8; 32],
+        _wallet: &LocalWallet,
     ) -> Result<TxHash> {
-        let task_registry = self.task_registry_address
+        let _task_registry = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
         // TODO: Call TaskRegistry.submitResult(taskId, resultHash)
@@ -140,8 +140,8 @@ impl BlockchainClient {
     }
 
     /// Get COMP token balance
-    pub async fn get_comp_balance(&self, address: Address) -> Result<U256> {
-        let token_reward = self.token_reward_address
+    pub async fn get_comp_balance(&self, _address: Address) -> Result<U256> {
+        let _token_reward = self.token_reward_address
             .context("TokenReward address not discovered")?;
 
         // TODO: Call COMPToken.balanceOf(address)
@@ -149,7 +149,7 @@ impl BlockchainClient {
     }
 
     /// Get GOV token balance
-    pub async fn get_gov_balance(&self, address: Address) -> Result<U256> {
+    pub async fn get_gov_balance(&self, _address: Address) -> Result<U256> {
         // TODO: Implement
         Ok(U256::zero())
     }

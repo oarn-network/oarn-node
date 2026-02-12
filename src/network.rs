@@ -5,9 +5,11 @@
 
 use anyhow::Result;
 use libp2p::{
-    gossipsub, identify, kad, noise, ping, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
-    Multiaddr, PeerId, Swarm,
+    gossipsub, identify, kad, noise, ping,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, Swarm, StreamProtocol,
 };
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -25,7 +27,7 @@ pub enum NetworkEvent {
 }
 
 /// Task announcement received via gossipsub
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAnnouncement {
     pub id: u64,
     pub model_hash: String,
@@ -47,7 +49,7 @@ pub struct OARNBehaviour {
 /// P2P Network manager
 pub struct P2PNetwork {
     swarm: Swarm<OARNBehaviour>,
-    event_tx: mpsc::Sender<NetworkEvent>,
+    _event_tx: mpsc::Sender<NetworkEvent>,
     event_rx: mpsc::Receiver<NetworkEvent>,
 }
 
@@ -62,59 +64,50 @@ impl P2PNetwork {
 
         info!("Local peer ID: {}", local_peer_id);
 
-        // Create transport
-        let transport = tcp::tokio::Transport::default()
-            .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-            .authenticate(noise::Config::new(&local_key)?)
-            .multiplex(yamux::Config::default())
-            .boxed();
+        // Create swarm with tokio runtime
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_behaviour(|key| {
+                // Create gossipsub
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(10))
+                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .build()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Create gossipsub
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(10))
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .build()
-            .map_err(|e| anyhow::anyhow!("Gossipsub config error: {}", e))?;
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_config,
+                )?;
 
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(local_key.clone()),
-            gossipsub_config,
-        )?;
+                // Create Kademlia DHT with default protocol
+                let store = kad::store::MemoryStore::new(local_peer_id);
+                let kademlia_config = kad::Config::default();
+                let kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
 
-        // Create Kademlia DHT
-        let store = kad::store::MemoryStore::new(local_peer_id);
-        let mut kademlia_config = kad::Config::default();
-        kademlia_config.set_protocol_names(vec![
-            libp2p::StreamProtocol::try_from_owned(config.network.discovery.dht_protocol.clone())
-                .unwrap(),
-        ]);
-        let kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
+                // Create identify
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    "/oarn/id/1.0.0".to_string(),
+                    key.public(),
+                ));
 
-        // Create identify
-        let identify = identify::Behaviour::new(identify::Config::new(
-            "/oarn/id/1.0.0".to_string(),
-            local_key.public(),
-        ));
+                // Create ping
+                let ping = ping::Behaviour::new(ping::Config::new());
 
-        // Create ping
-        let ping = ping::Behaviour::new(ping::Config::new());
-
-        // Create behaviour
-        let behaviour = OARNBehaviour {
-            gossipsub,
-            kademlia,
-            identify,
-            ping,
-        };
-
-        // Create swarm
-        let mut swarm = Swarm::new(
-            transport,
-            behaviour,
-            local_peer_id,
-            libp2p::swarm::Config::with_tokio_executor()
-                .with_idle_connection_timeout(Duration::from_secs(60)),
-        );
+                Ok(OARNBehaviour {
+                    gossipsub,
+                    kademlia,
+                    identify,
+                    ping,
+                })
+            })?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
 
         // Listen on configured addresses
         for addr in &config.network.listen_addresses {
@@ -124,11 +117,13 @@ impl P2PNetwork {
 
         // Bootstrap from discovered nodes (NOT hardcoded!)
         for node in discovery.get_bootstrap_nodes().await? {
-            let addr: Multiaddr = node.multiaddr.parse()?;
-            let peer_id: PeerId = node.peer_id.parse()?;
-
-            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
-            debug!("Added bootstrap node: {} at {}", peer_id, addr);
+            if let (Ok(addr), Ok(peer_id)) = (
+                node.multiaddr.parse::<Multiaddr>(),
+                node.peer_id.parse::<PeerId>(),
+            ) {
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                debug!("Added bootstrap node: {} at {}", peer_id, addr);
+            }
         }
 
         // Start DHT bootstrap
@@ -142,7 +137,7 @@ impl P2PNetwork {
 
         Ok(Self {
             swarm,
-            event_tx,
+            _event_tx: event_tx,
             event_rx,
         })
     }
@@ -154,6 +149,8 @@ impl P2PNetwork {
 
     /// Get next network event
     pub async fn next_event(&mut self) -> Option<NetworkEvent> {
+        use futures::StreamExt;
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {

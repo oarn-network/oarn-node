@@ -284,7 +284,9 @@ fn default_chain_id() -> u64 { 421614 } // Arbitrum Sepolia
 fn default_rpc_discovery() -> String { "registry".to_string() }
 fn default_rpc_redundancy() -> usize { 3 }
 fn default_ipfs_api() -> String { "http://127.0.0.1:5001".to_string() }
-fn default_cache_dir() -> PathBuf { dirs::cache_dir().unwrap_or_default().join("oarn") }
+fn default_cache_dir() -> PathBuf {
+    dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("oarn")
+}
 fn default_cache_size() -> u64 { 10240 } // 10 GB
 fn default_frameworks() -> Vec<String> { vec!["onnx".to_string(), "pytorch".to_string()] }
 fn default_concurrent_tasks() -> usize { 1 }

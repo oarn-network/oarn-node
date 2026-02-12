@@ -2,7 +2,7 @@
 //!
 //! Handles AI model execution in a sandboxed environment
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
@@ -202,20 +202,20 @@ impl ComputeEngine {
         }
     }
 
-    async fn execute_onnx(&self, model_path: &PathBuf, input_path: &PathBuf) -> Result<Vec<u8>> {
+    async fn execute_onnx(&self, _model_path: &PathBuf, _input_path: &PathBuf) -> Result<Vec<u8>> {
         // TODO: Implement ONNX Runtime execution
         // For now, return placeholder
         info!("ONNX execution not yet implemented");
         Ok(vec![0u8; 32]) // Placeholder result
     }
 
-    async fn execute_pytorch(&self, model_path: &PathBuf, input_path: &PathBuf) -> Result<Vec<u8>> {
+    async fn execute_pytorch(&self, _model_path: &PathBuf, _input_path: &PathBuf) -> Result<Vec<u8>> {
         // TODO: Implement PyTorch execution via tch-rs
         info!("PyTorch execution not yet implemented");
         Ok(vec![0u8; 32])
     }
 
-    async fn execute_tensorflow(&self, model_path: &PathBuf, input_path: &PathBuf) -> Result<Vec<u8>> {
+    async fn execute_tensorflow(&self, _model_path: &PathBuf, _input_path: &PathBuf) -> Result<Vec<u8>> {
         // TODO: Implement TensorFlow execution
         info!("TensorFlow execution not yet implemented");
         Ok(vec![0u8; 32])
@@ -243,10 +243,11 @@ pub struct ResourceUsage {
 
 /// Detect available system resources
 fn detect_resources() -> (Option<u64>, Option<u64>) {
-    // RAM detection
-    let ram_mb = sys_info::mem_info()
-        .ok()
-        .map(|info| info.total / 1024); // Convert KB to MB
+    // RAM detection using sysinfo
+    use sysinfo::System;
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let ram_mb = Some(sys.total_memory() / (1024 * 1024)); // Convert bytes to MB
 
     // VRAM detection would require GPU-specific libraries
     // TODO: Implement CUDA/ROCm detection

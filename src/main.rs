@@ -16,7 +16,7 @@ mod discovery;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, error, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::cli::{Cli, Commands};
@@ -25,7 +25,7 @@ use crate::config::Config;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    let _subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
@@ -61,9 +61,9 @@ async fn main() -> Result<()> {
 
 /// Run the main node loop
 async fn run_node(config: Config) -> Result<()> {
-    info!("=".repeat(50));
+    info!("{}", "=".repeat(50));
     info!("OARN Node v{}", env!("CARGO_PKG_VERSION"));
-    info!("=".repeat(50));
+    info!("{}", "=".repeat(50));
 
     // Step 1: Discover infrastructure (no hardcoded values!)
     info!("Discovering network infrastructure...");
@@ -71,7 +71,7 @@ async fn run_node(config: Config) -> Result<()> {
 
     // Step 2: Initialize blockchain connection
     info!("Connecting to blockchain...");
-    let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
+    let mut blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
     info!("Connected to chain ID: {}", blockchain.chain_id());
 
     // Step 3: Initialize P2P network
@@ -89,7 +89,7 @@ async fn run_node(config: Config) -> Result<()> {
 
     info!("Node started successfully!");
     info!("Listening on: {:?}", config.network.listen_addresses);
-    info!("-".repeat(50));
+    info!("{}", "-".repeat(50));
 
     // Main event loop
     loop {
@@ -121,9 +121,9 @@ async fn run_node(config: Config) -> Result<()> {
 
 async fn handle_network_event(
     event: network::NetworkEvent,
-    blockchain: &blockchain::BlockchainClient,
-    storage: &storage::IpfsStorage,
-    compute: &compute::ComputeEngine,
+    _blockchain: &blockchain::BlockchainClient,
+    _storage: &storage::IpfsStorage,
+    _compute: &compute::ComputeEngine,
 ) -> Result<()> {
     match event {
         network::NetworkEvent::PeerConnected(peer_id) => {
@@ -136,7 +136,7 @@ async fn handle_network_event(
             info!("New task announced: {}", task.id);
             // TODO: Evaluate if we can handle this task
         }
-        network::NetworkEvent::ResultReceived(task_id, result) => {
+        network::NetworkEvent::ResultReceived(task_id, _result) => {
             info!("Result received for task: {}", task_id);
         }
     }
@@ -145,7 +145,7 @@ async fn handle_network_event(
 
 async fn handle_blockchain_event(
     event: blockchain::BlockchainEvent,
-    network: &mut network::P2PNetwork,
+    _network: &mut network::P2PNetwork,
 ) -> Result<()> {
     match event {
         blockchain::BlockchainEvent::TaskCreated(task_id) => {
@@ -164,20 +164,20 @@ async fn handle_blockchain_event(
 
 async fn show_status(config: Config) -> Result<()> {
     println!("Node Status");
-    println!("-".repeat(40));
+    println!("{}", "-".repeat(40));
     println!("Config file: {:?}", config.path);
     println!("Mode: {:?}", config.mode);
     println!("Listen addresses: {:?}", config.network.listen_addresses);
     Ok(())
 }
 
-async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Result<()> {
+async fn handle_tasks(_config: Config, subcommand: cli::TasksSubcommand) -> Result<()> {
     match subcommand {
         cli::TasksSubcommand::List => {
             println!("Available tasks:");
             // TODO: Query blockchain for available tasks
         }
-        cli::TasksSubcommand::Submit { model, input, reward, nodes } => {
+        cli::TasksSubcommand::Submit { model: _, input: _, reward: _, nodes: _ } => {
             println!("Submitting task...");
             // TODO: Submit task via blockchain
         }
@@ -189,7 +189,7 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Resul
     Ok(())
 }
 
-async fn handle_wallet(config: Config, subcommand: cli::WalletSubcommand) -> Result<()> {
+async fn handle_wallet(_config: Config, subcommand: cli::WalletSubcommand) -> Result<()> {
     match subcommand {
         cli::WalletSubcommand::Balance => {
             println!("Wallet balance:");
