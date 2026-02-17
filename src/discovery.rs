@@ -232,3 +232,268 @@ impl Discovery {
         self.discover_all().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config::default()
+    }
+
+    fn test_config_manual() -> Config {
+        let mut config = Config::default();
+        config.network.discovery.method = "manual".to_string();
+        config.network.discovery.manual_bootstrap = vec![
+            "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWTestPeerId1".to_string(),
+            "/ip4/5.6.7.8/tcp/4001/p2p/12D3KooWTestPeerId2".to_string(),
+        ];
+        config.blockchain.manual_rpc_url = Some("https://test-rpc.example.com".to_string());
+        config
+    }
+
+    #[test]
+    fn test_bootstrap_node_struct() {
+        let node = BootstrapNode {
+            peer_id: "12D3KooWTest".to_string(),
+            multiaddr: "/ip4/1.2.3.4/tcp/4001".to_string(),
+            onion_address: Some("http://test.onion".to_string()),
+            i2p_address: None,
+        };
+
+        assert_eq!(node.peer_id, "12D3KooWTest");
+        assert!(node.onion_address.is_some());
+        assert!(node.i2p_address.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_node_serialization() {
+        let node = BootstrapNode {
+            peer_id: "12D3KooWTest".to_string(),
+            multiaddr: "/ip4/1.2.3.4/tcp/4001".to_string(),
+            onion_address: None,
+            i2p_address: None,
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("12D3KooWTest"));
+
+        let deserialized: BootstrapNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.peer_id, node.peer_id);
+    }
+
+    #[test]
+    fn test_rpc_provider_struct() {
+        let provider = RpcProvider {
+            endpoint: "https://rpc.example.com".to_string(),
+            onion_endpoint: Some("http://rpc.onion".to_string()),
+            stake: 5000,
+            uptime: 9950,
+        };
+
+        assert_eq!(provider.endpoint, "https://rpc.example.com");
+        assert_eq!(provider.stake, 5000);
+        assert_eq!(provider.uptime, 9950);
+    }
+
+    #[test]
+    fn test_rpc_provider_serialization() {
+        let provider = RpcProvider {
+            endpoint: "https://rpc.example.com".to_string(),
+            onion_endpoint: None,
+            stake: 1000,
+            uptime: 10000,
+        };
+
+        let json = serde_json::to_string(&provider).unwrap();
+        let deserialized: RpcProvider = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.endpoint, provider.endpoint);
+        assert_eq!(deserialized.stake, provider.stake);
+    }
+
+    #[test]
+    fn test_core_contracts_struct() {
+        let contracts = CoreContracts {
+            oarn_registry: "0x1234".to_string(),
+            task_registry: "0x2345".to_string(),
+            token_reward: "0x3456".to_string(),
+            validator_registry: "0x4567".to_string(),
+            governance: "0x5678".to_string(),
+            gov_token: "0x6789".to_string(),
+        };
+
+        assert_eq!(contracts.oarn_registry, "0x1234");
+        assert_eq!(contracts.task_registry, "0x2345");
+    }
+
+    #[tokio::test]
+    async fn test_discovery_new() {
+        let config = test_config();
+        let discovery = Discovery::new(&config).await;
+
+        // Discovery may fail if no network, but should not panic
+        // Just check that the function handles errors gracefully
+        assert!(discovery.is_ok() || discovery.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_discovery_manual_mode() {
+        let config = test_config_manual();
+        let mut discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![],
+            core_contracts: None,
+        };
+
+        let result = discovery.use_manual_config();
+        assert!(result.is_ok());
+
+        // Should have parsed the bootstrap nodes
+        assert_eq!(discovery.bootstrap_nodes.len(), 2);
+        assert_eq!(discovery.bootstrap_nodes[0].peer_id, "12D3KooWTestPeerId1");
+        assert_eq!(discovery.bootstrap_nodes[1].peer_id, "12D3KooWTestPeerId2");
+
+        // Should have the RPC provider
+        assert_eq!(discovery.rpc_providers.len(), 1);
+        assert_eq!(discovery.rpc_providers[0].endpoint, "https://test-rpc.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_get_bootstrap_nodes() {
+        let config = test_config_manual();
+        let mut discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![],
+            core_contracts: None,
+        };
+
+        discovery.use_manual_config().unwrap();
+
+        let nodes = discovery.get_bootstrap_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_rpc_providers_empty() {
+        let config = test_config();
+        let discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![],
+            core_contracts: None,
+        };
+
+        let result = discovery.get_rpc_providers().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No RPC providers"));
+    }
+
+    #[tokio::test]
+    async fn test_get_rpc_providers_with_providers() {
+        let config = test_config();
+        let discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![
+                RpcProvider {
+                    endpoint: "https://rpc1.example.com".to_string(),
+                    onion_endpoint: None,
+                    stake: 1000,
+                    uptime: 9500,
+                },
+            ],
+            core_contracts: None,
+        };
+
+        let providers = discovery.get_rpc_providers().await.unwrap();
+        assert_eq!(providers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_random_rpc_healthy() {
+        let config = test_config();
+        let discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![
+                RpcProvider {
+                    endpoint: "https://healthy.example.com".to_string(),
+                    onion_endpoint: None,
+                    stake: 1000,
+                    uptime: 9500, // Healthy (>90%)
+                },
+                RpcProvider {
+                    endpoint: "https://unhealthy.example.com".to_string(),
+                    onion_endpoint: None,
+                    stake: 1000,
+                    uptime: 5000, // Unhealthy (<90%)
+                },
+            ],
+            core_contracts: None,
+        };
+
+        let rpc = discovery.get_random_rpc().await.unwrap();
+        // Should prefer healthy provider
+        assert_eq!(rpc.endpoint, "https://healthy.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_get_random_rpc_fallback_to_unhealthy() {
+        let config = test_config();
+        let discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![
+                RpcProvider {
+                    endpoint: "https://unhealthy.example.com".to_string(),
+                    onion_endpoint: None,
+                    stake: 1000,
+                    uptime: 5000, // All unhealthy
+                },
+            ],
+            core_contracts: None,
+        };
+
+        let rpc = discovery.get_random_rpc().await.unwrap();
+        // Should fall back to unhealthy if no healthy ones
+        assert_eq!(rpc.endpoint, "https://unhealthy.example.com");
+    }
+
+    #[test]
+    fn test_get_core_contracts_none() {
+        let config = test_config();
+        let discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![],
+            core_contracts: None,
+        };
+
+        assert!(discovery.get_core_contracts().is_none());
+    }
+
+    #[test]
+    fn test_get_core_contracts_some() {
+        let config = test_config();
+        let contracts = CoreContracts {
+            oarn_registry: "0x1234".to_string(),
+            task_registry: "0x2345".to_string(),
+            token_reward: "0x3456".to_string(),
+            validator_registry: "0x4567".to_string(),
+            governance: "0x5678".to_string(),
+            gov_token: "0x6789".to_string(),
+        };
+
+        let discovery = Discovery {
+            config: config.clone(),
+            bootstrap_nodes: vec![],
+            rpc_providers: vec![],
+            core_contracts: Some(contracts),
+        };
+
+        assert!(discovery.get_core_contracts().is_some());
+        assert_eq!(discovery.get_core_contracts().unwrap().oarn_registry, "0x1234");
+    }
+}

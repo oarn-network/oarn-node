@@ -351,3 +351,163 @@ impl Default for Config {
         Self::default_with_path(PathBuf::from("~/.oarn/config.toml"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_node_mode_default() {
+        let mode = NodeMode::default();
+        assert!(matches!(mode, NodeMode::Standard));
+    }
+
+    #[test]
+    fn test_node_mode_serialization() {
+        let mode = NodeMode::ValidatorRouted;
+        let serialized = toml::to_string(&mode).unwrap();
+        assert!(serialized.contains("validatorrouted"));
+    }
+
+    #[test]
+    fn test_network_config_defaults() {
+        let config = NetworkConfig::default();
+        assert_eq!(config.max_peers, 50);
+        assert_eq!(config.connection_timeout, 30);
+        assert!(config.listen_addresses.len() == 2);
+    }
+
+    #[test]
+    fn test_discovery_config_defaults() {
+        let config = DiscoveryConfig::default();
+        assert_eq!(config.method, "auto");
+        assert_eq!(config.ens_registry, "oarn-registry.eth");
+        assert_eq!(config.dht_protocol, "/oarn/kad/1.0.0");
+        assert!(config.manual_bootstrap.is_empty());
+    }
+
+    #[test]
+    fn test_blockchain_config_defaults() {
+        let config = BlockchainConfig::default();
+        assert_eq!(config.chain_id, 421614); // Arbitrum Sepolia
+        assert_eq!(config.rpc_discovery, "registry");
+        assert_eq!(config.rpc_redundancy, 3);
+        assert!(config.manual_rpc_url.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_defaults() {
+        let config = StorageConfig::default();
+        assert_eq!(config.ipfs_api, "http://127.0.0.1:5001");
+        assert_eq!(config.max_cache_mb, 10240);
+    }
+
+    #[test]
+    fn test_compute_config_defaults() {
+        let config = ComputeConfig::default();
+        assert!(config.max_vram_mb.is_none());
+        assert!(config.max_ram_mb.is_none());
+        assert_eq!(config.concurrent_tasks, 1);
+        assert!(config.frameworks.contains(&"onnx".to_string()));
+    }
+
+    #[test]
+    fn test_privacy_config_defaults() {
+        let config = PrivacyConfig::default();
+        assert!(!config.tor_enabled);
+        assert!(config.padding_enabled);
+        assert!(config.rotate_peers);
+        assert_eq!(config.rotation_interval_mins, 30);
+        assert!(!config.ephemeral_addresses);
+    }
+
+    #[test]
+    fn test_wallet_config_defaults() {
+        let config = WalletConfig::default();
+        assert!(config.keystore_path.is_none());
+        assert!(config.use_hd_wallet);
+        assert_eq!(config.derivation_path, "m/44'/60'/0'/0");
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(matches!(config.mode, NodeMode::Standard));
+        assert_eq!(config.blockchain.chain_id, 421614);
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let result = Config::load(Path::new("/nonexistent/path/config.toml"));
+        assert!(result.is_ok());
+        // Should return default config when file doesn't exist
+        let config = result.unwrap();
+        assert!(matches!(config.mode, NodeMode::Standard));
+    }
+
+    #[test]
+    fn test_load_valid_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let content = r#"
+mode = "local"
+
+[network]
+max_peers = 100
+
+[blockchain]
+chain_id = 42161
+"#;
+        fs::write(&config_path, content).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert!(matches!(config.mode, NodeMode::Local));
+        assert_eq!(config.network.max_peers, 100);
+        assert_eq!(config.blockchain.chain_id, 42161);
+    }
+
+    #[test]
+    fn test_load_partial_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        // Only specify some fields, rest should use defaults
+        let content = r#"
+mode = "validatorrouted"
+"#;
+        fs::write(&config_path, content).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert!(matches!(config.mode, NodeMode::ValidatorRouted));
+        // Defaults should be applied
+        assert_eq!(config.network.max_peers, 50);
+        assert_eq!(config.blockchain.chain_id, 421614);
+    }
+
+    #[test]
+    fn test_config_serialization_roundtrip() {
+        let config = Config::default();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(config.network.max_peers, deserialized.network.max_peers);
+        assert_eq!(config.blockchain.chain_id, deserialized.blockchain.chain_id);
+    }
+
+    #[test]
+    fn test_default_listen_addresses() {
+        let addresses = default_listen_addresses();
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses[0].contains("/ip4/0.0.0.0"));
+        assert!(addresses[1].contains("/ip6/::"));
+    }
+
+    #[test]
+    fn test_default_cache_dir() {
+        let cache_dir = default_cache_dir();
+        assert!(cache_dir.to_string_lossy().contains("oarn"));
+    }
+}

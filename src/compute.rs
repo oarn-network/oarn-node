@@ -255,3 +255,184 @@ fn detect_resources() -> (Option<u64>, Option<u64>) {
 
     (vram_mb, ram_mb)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_framework_from_str_onnx() {
+        assert_eq!(Framework::from("onnx"), Framework::ONNX);
+        assert_eq!(Framework::from("ONNX"), Framework::ONNX);
+    }
+
+    #[test]
+    fn test_framework_from_str_pytorch() {
+        assert_eq!(Framework::from("pytorch"), Framework::PyTorch);
+        assert_eq!(Framework::from("PyTorch"), Framework::PyTorch);
+        assert_eq!(Framework::from("torch"), Framework::PyTorch);
+    }
+
+    #[test]
+    fn test_framework_from_str_tensorflow() {
+        assert_eq!(Framework::from("tensorflow"), Framework::TensorFlow);
+        assert_eq!(Framework::from("TensorFlow"), Framework::TensorFlow);
+        assert_eq!(Framework::from("tf"), Framework::TensorFlow);
+    }
+
+    #[test]
+    fn test_framework_from_str_unknown() {
+        let framework = Framework::from("custom_framework");
+        assert!(matches!(framework, Framework::Unknown(s) if s == "custom_framework"));
+    }
+
+    #[test]
+    fn test_parse_memory_string_gb() {
+        assert_eq!(parse_memory_string("8GB"), Some(8192)); // 8 * 1024
+        assert_eq!(parse_memory_string("16gb"), Some(16384));
+        assert_eq!(parse_memory_string("1GB"), Some(1024));
+    }
+
+    #[test]
+    fn test_parse_memory_string_mb() {
+        assert_eq!(parse_memory_string("4096MB"), Some(4096));
+        assert_eq!(parse_memory_string("512mb"), Some(512));
+    }
+
+    #[test]
+    fn test_parse_memory_string_plain() {
+        assert_eq!(parse_memory_string("1024"), Some(1024));
+    }
+
+    #[test]
+    fn test_parse_memory_string_invalid() {
+        assert_eq!(parse_memory_string("invalid"), None);
+        assert_eq!(parse_memory_string(""), None);
+    }
+
+    #[test]
+    fn test_model_requirements_from_json() {
+        let json = r#"{"framework": "onnx", "min_vram": "4GB", "min_ram": "8GB", "gpu_required": true}"#;
+        let requirements = ModelRequirements::from_json(json).unwrap();
+
+        assert_eq!(requirements.framework, Framework::ONNX);
+        assert_eq!(requirements.min_vram_mb, Some(4096));
+        assert_eq!(requirements.min_ram_mb, Some(8192));
+        assert!(requirements.gpu_required);
+    }
+
+    #[test]
+    fn test_model_requirements_from_json_minimal() {
+        let json = r#"{}"#;
+        let requirements = ModelRequirements::from_json(json).unwrap();
+
+        assert!(matches!(requirements.framework, Framework::Unknown(_)));
+        assert!(requirements.min_vram_mb.is_none());
+        assert!(requirements.min_ram_mb.is_none());
+        assert!(!requirements.gpu_required);
+    }
+
+    #[test]
+    fn test_model_requirements_from_json_partial() {
+        let json = r#"{"framework": "pytorch", "gpu_required": false}"#;
+        let requirements = ModelRequirements::from_json(json).unwrap();
+
+        assert_eq!(requirements.framework, Framework::PyTorch);
+        assert!(requirements.min_vram_mb.is_none());
+        assert!(!requirements.gpu_required);
+    }
+
+    #[test]
+    fn test_compute_engine_new() {
+        let config = crate::config::Config::default();
+        let engine = ComputeEngine::new(&config).unwrap();
+
+        assert!(engine.supported_frameworks.contains(&Framework::ONNX));
+        assert!(engine.supported_frameworks.contains(&Framework::PyTorch));
+        assert_eq!(engine.concurrent_tasks, 1);
+        assert_eq!(engine.active_tasks, 0);
+    }
+
+    #[test]
+    fn test_compute_engine_can_handle_supported_framework() {
+        let config = crate::config::Config::default();
+        let engine = ComputeEngine::new(&config).unwrap();
+
+        let requirements = ModelRequirements {
+            framework: Framework::ONNX,
+            min_vram_mb: None,
+            min_ram_mb: None,
+            gpu_required: false,
+        };
+
+        assert!(engine.can_handle(&requirements));
+    }
+
+    #[test]
+    fn test_compute_engine_can_handle_unsupported_framework() {
+        let config = crate::config::Config::default();
+        let engine = ComputeEngine::new(&config).unwrap();
+
+        let requirements = ModelRequirements {
+            framework: Framework::TensorFlow,
+            min_vram_mb: None,
+            min_ram_mb: None,
+            gpu_required: false,
+        };
+
+        // TensorFlow is not in default frameworks
+        assert!(!engine.can_handle(&requirements));
+    }
+
+    #[test]
+    fn test_compute_engine_can_handle_unknown_framework() {
+        let config = crate::config::Config::default();
+        let engine = ComputeEngine::new(&config).unwrap();
+
+        let requirements = ModelRequirements {
+            framework: Framework::Unknown("custom".to_string()),
+            min_vram_mb: None,
+            min_ram_mb: None,
+            gpu_required: false,
+        };
+
+        // Unknown frameworks should be allowed (flexible)
+        assert!(engine.can_handle(&requirements));
+    }
+
+    #[test]
+    fn test_compute_engine_resource_usage() {
+        let config = crate::config::Config::default();
+        let engine = ComputeEngine::new(&config).unwrap();
+
+        let usage = engine.resource_usage();
+        assert_eq!(usage.active_tasks, 0);
+        assert_eq!(usage.max_tasks, 1);
+    }
+
+    #[test]
+    fn test_detect_resources() {
+        let (vram, ram) = detect_resources();
+
+        // VRAM detection not implemented, should be None
+        assert!(vram.is_none());
+
+        // RAM should be detected
+        assert!(ram.is_some());
+        assert!(ram.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_resource_usage_clone() {
+        let usage = ResourceUsage {
+            active_tasks: 1,
+            max_tasks: 4,
+            vram_available_mb: Some(8192),
+            ram_available_mb: Some(16384),
+        };
+
+        let cloned = usage.clone();
+        assert_eq!(cloned.active_tasks, 1);
+        assert_eq!(cloned.max_tasks, 4);
+    }
+}

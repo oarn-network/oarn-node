@@ -137,3 +137,135 @@ impl IpfsStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    fn test_config_with_cache(cache_dir: PathBuf) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.storage.cache_dir = cache_dir;
+        config.storage.max_cache_mb = 100;
+        config
+    }
+
+    #[tokio::test]
+    async fn test_exists_with_cached_file() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        let config = test_config_with_cache(cache_dir.clone());
+
+        // Create a fake cached file
+        let cid = "QmTestCid123";
+        let cache_path = cache_dir.join(cid);
+        fs::create_dir_all(&cache_dir).await.unwrap();
+        fs::write(&cache_path, b"test content").await.unwrap();
+
+        // Create storage with test config (without connecting to IPFS)
+        let storage = IpfsStorage {
+            client: IpfsClient::from_str("http://127.0.0.1:5001").unwrap(),
+            cache_dir,
+            max_cache_mb: 100,
+        };
+
+        assert!(storage.exists(cid).await);
+        assert!(!storage.exists("QmNonExistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_cache_size_empty() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        fs::create_dir_all(&cache_dir).await.unwrap();
+
+        let storage = IpfsStorage {
+            client: IpfsClient::from_str("http://127.0.0.1:5001").unwrap(),
+            cache_dir,
+            max_cache_mb: 100,
+        };
+
+        let size = storage.cache_size().await.unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_size_with_files() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        fs::create_dir_all(&cache_dir).await.unwrap();
+
+        // Create some test files
+        fs::write(cache_dir.join("file1"), b"test content 1").await.unwrap();
+        fs::write(cache_dir.join("file2"), b"test content 2").await.unwrap();
+
+        let storage = IpfsStorage {
+            client: IpfsClient::from_str("http://127.0.0.1:5001").unwrap(),
+            cache_dir,
+            max_cache_mb: 100,
+        };
+
+        let size = storage.cache_size().await.unwrap();
+        assert!(size > 0);
+        // "test content 1" + "test content 2" = 14 + 14 = 28 bytes
+        assert_eq!(size, 28);
+    }
+
+    #[tokio::test]
+    async fn test_clean_cache_under_limit() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        fs::create_dir_all(&cache_dir).await.unwrap();
+
+        // Create a small file (well under 100 MB limit)
+        fs::write(cache_dir.join("small_file"), b"small content").await.unwrap();
+
+        let storage = IpfsStorage {
+            client: IpfsClient::from_str("http://127.0.0.1:5001").unwrap(),
+            cache_dir,
+            max_cache_mb: 100,
+        };
+
+        // Should succeed without error
+        let result = storage.clean_cache().await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ipfs_storage_fields() {
+        let storage = IpfsStorage {
+            client: IpfsClient::from_str("http://127.0.0.1:5001").unwrap(),
+            cache_dir: PathBuf::from("/tmp/test"),
+            max_cache_mb: 1024,
+        };
+
+        assert_eq!(storage.cache_dir, PathBuf::from("/tmp/test"));
+        assert_eq!(storage.max_cache_mb, 1024);
+    }
+
+    // Note: Tests that require actual IPFS connection are integration tests
+    // and should be run with a local IPFS daemon
+
+    #[tokio::test]
+    async fn test_get_from_cache() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        let cid = "QmTestCachedCid";
+        let content = b"cached test content";
+
+        fs::create_dir_all(&cache_dir).await.unwrap();
+        fs::write(cache_dir.join(cid), content).await.unwrap();
+
+        let storage = IpfsStorage {
+            client: IpfsClient::from_str("http://127.0.0.1:5001").unwrap(),
+            cache_dir,
+            max_cache_mb: 100,
+        };
+
+        // Getting from cache should work even without IPFS
+        let result = storage.get(cid).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), content.to_vec());
+    }
+}
