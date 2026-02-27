@@ -25,8 +25,11 @@ abigen!(
         function tasks(uint256 taskId) external view returns (uint256 id, address requester, bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 completedNodes, uint256 deadline, uint8 status, uint8 mode, uint256 createdAt)
         function claimTask(uint256 taskId) external
         function submitResult(uint256 taskId, bytes32 resultHash) external
+        function submitTask(bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 deadline) external payable returns (uint256)
         function hasClaimedTask(uint256 taskId, address node) external view returns (bool)
         function hasSubmittedResult(uint256 taskId, address node) external view returns (bool)
+        function minRewardPerNode() external view returns (uint256)
+        function getTask(uint256 taskId) external view returns (uint256 id, address requester, bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 completedNodes, uint256 deadline, uint8 status, uint8 mode, uint256 createdAt)
         event TaskCreated(uint256 indexed taskId, address indexed requester, bytes32 modelHash, uint256 rewardPerNode, uint256 requiredNodes, uint8 mode)
         event TaskClaimed(uint256 indexed taskId, address indexed node)
         event ResultSubmitted(uint256 indexed taskId, address indexed node, bytes32 resultHash)
@@ -299,6 +302,109 @@ impl BlockchainClient {
         Ok(tx_hash)
     }
 
+    /// Submit a new task to the network
+    pub async fn submit_task(
+        &self,
+        model_hash: [u8; 32],
+        input_hash: [u8; 32],
+        model_requirements: &str,
+        reward_per_node: U256,
+        required_nodes: u64,
+        deadline: u64,
+        wallet: &LocalWallet,
+    ) -> Result<(TxHash, u64)> {
+        let contract_address = self.task_registry_address
+            .context("TaskRegistry address not discovered")?;
+
+        info!("Submitting new task to TaskRegistry...");
+        info!("  Model hash: 0x{}", hex::encode(model_hash));
+        info!("  Input hash: 0x{}", hex::encode(input_hash));
+        info!("  Reward per node: {} ETH", ethers::utils::format_ether(reward_per_node));
+        info!("  Required nodes: {}", required_nodes);
+
+        // Calculate total cost
+        let total_cost = reward_per_node * U256::from(required_nodes);
+        info!("  Total cost: {} ETH", ethers::utils::format_ether(total_cost));
+
+        // Create a signing client
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = TaskRegistryContract::new(contract_address, client);
+
+        // Create the contract call with value
+        let call = contract
+            .submit_task(
+                model_hash,
+                input_hash,
+                model_requirements.to_string(),
+                reward_per_node,
+                U256::from(required_nodes),
+                U256::from(deadline),
+            )
+            .value(total_cost);
+
+        // Send and await the transaction
+        let pending_tx = call.send().await
+            .context("Failed to send submitTask transaction")?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Task submission transaction sent: {:?}", tx_hash);
+
+        // Wait for confirmation
+        let receipt = pending_tx.await?
+            .context("Transaction failed")?;
+
+        info!("Task submitted in block {:?}", receipt.block_number);
+
+        // Get the new task count to determine the task ID
+        let task_id = self.get_task_count().await?;
+
+        info!("Task created with ID: {}", task_id);
+        Ok((tx_hash, task_id))
+    }
+
+    /// Get detailed task information
+    pub async fn get_task_details(&self, task_id: u64) -> Result<TaskDetails> {
+        let contract = self.task_registry.as_ref()
+            .context("TaskRegistry contract not initialized")?;
+
+        // Use the tasks mapping which we know works
+        let task = contract.tasks(U256::from(task_id)).call().await
+            .context("Failed to get task details")?;
+
+        // Check if task exists (id will be 0 if not found)
+        if task.0.is_zero() {
+            anyhow::bail!("Task not found");
+        }
+
+        Ok(TaskDetails {
+            id: task.0.as_u64(),
+            requester: task.1,
+            model_hash: task.2,
+            input_hash: task.3,
+            model_requirements: task.4,
+            reward_per_node: task.5,
+            required_nodes: task.6.as_u32(),
+            completed_nodes: task.7.as_u32(),
+            deadline: task.8.as_u64(),
+            status: task.9,
+            mode: task.10,
+            created_at: task.11.as_u64(),
+        })
+    }
+
+    /// Get minimum reward per node
+    pub async fn get_min_reward(&self) -> Result<U256> {
+        let contract = self.task_registry.as_ref()
+            .context("TaskRegistry contract not initialized")?;
+
+        let min_reward = contract.min_reward_per_node().call().await?;
+        Ok(min_reward)
+    }
+
     /// Get task count
     pub async fn get_task_count(&self) -> Result<u64> {
         let contract = self.task_registry.as_ref()
@@ -395,4 +501,44 @@ pub struct NodeEarnings {
     pub eth_balance: U256,
     pub comp_balance: U256,
     pub tasks_completed: u64,
+}
+
+/// Detailed task information
+#[derive(Debug, Clone)]
+pub struct TaskDetails {
+    pub id: u64,
+    pub requester: Address,
+    pub model_hash: [u8; 32],
+    pub input_hash: [u8; 32],
+    pub model_requirements: String,
+    pub reward_per_node: U256,
+    pub required_nodes: u32,
+    pub completed_nodes: u32,
+    pub deadline: u64,
+    pub status: u8,
+    pub mode: u8,
+    pub created_at: u64,
+}
+
+impl TaskDetails {
+    /// Get status as human-readable string
+    pub fn status_str(&self) -> &'static str {
+        match self.status {
+            0 => "Pending",
+            1 => "Active",
+            2 => "Completed",
+            3 => "Cancelled",
+            4 => "Expired",
+            _ => "Unknown",
+        }
+    }
+
+    /// Get mode as human-readable string
+    pub fn mode_str(&self) -> &'static str {
+        match self.mode {
+            0 => "Standard",
+            1 => "ValidatorRouted",
+            _ => "Unknown",
+        }
+    }
 }

@@ -406,22 +406,287 @@ async fn show_status(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn handle_tasks(_config: Config, subcommand: cli::TasksSubcommand) -> Result<()> {
+async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Result<()> {
+    // Initialize discovery and blockchain connection
+    let discovery = discovery::Discovery::new(&config).await?;
+    let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
+
     match subcommand {
-        cli::TasksSubcommand::List => {
-            println!("Available tasks:");
-            // TODO: Query blockchain for available tasks
+        cli::TasksSubcommand::List { all, limit } => {
+            println!("Querying tasks from blockchain...\n");
+
+            let tasks = blockchain.get_available_tasks().await?;
+
+            if tasks.is_empty() {
+                println!("No available tasks found.");
+                return Ok(());
+            }
+
+            println!("{}", "=".repeat(80));
+            println!("{:<6} {:<12} {:<15} {:<12} {:<10}", "ID", "Reward", "Nodes", "Deadline", "Status");
+            println!("{}", "-".repeat(80));
+
+            let mut shown = 0u32;
+            for task in &tasks {
+                if shown >= limit && !all {
+                    break;
+                }
+
+                let deadline_str = format_deadline(task.deadline);
+                println!(
+                    "{:<6} {:<12} {:<15} {:<12} {:<10}",
+                    task.id,
+                    format!("{:.4} ETH", ethers::utils::format_ether(task.reward_per_node)),
+                    format!("{} required", task.required_nodes),
+                    deadline_str,
+                    "Available"
+                );
+                shown += 1;
+            }
+
+            println!("{}", "=".repeat(80));
+            println!("Total: {} available tasks", tasks.len());
+
+            if tasks.len() as u32 > limit && !all {
+                println!("(Use --all to show all tasks)");
+            }
         }
-        cli::TasksSubcommand::Submit { model: _, input: _, reward: _, nodes: _ } => {
-            println!("Submitting task...");
-            // TODO: Submit task via blockchain
+
+        cli::TasksSubcommand::Submit {
+            model,
+            input,
+            reward,
+            nodes,
+            deadline_hours,
+            requirements,
+        } => {
+            // Load wallet
+            let wallet = load_wallet(&config)?
+                .context("Wallet required to submit tasks. Add 'private_key' to config.")?;
+
+            println!("Task Submission");
+            println!("{}", "=".repeat(50));
+
+            // Initialize IPFS storage
+            let storage = storage::IpfsStorage::new(&config).await?;
+
+            // Handle model - either IPFS CID or local file
+            let model_hash = if model.starts_with("Qm") || model.starts_with("bafy") {
+                println!("Using existing IPFS CID for model: {}", model);
+                cid_to_bytes32(&model)?
+            } else {
+                // Upload local file to IPFS
+                let path = std::path::PathBuf::from(&model);
+                if !path.exists() {
+                    anyhow::bail!("Model file not found: {}", model);
+                }
+                println!("Uploading model to IPFS: {}", model);
+                let data = tokio::fs::read(&path).await?;
+                let cid = storage.put(&data).await?;
+                println!("Model uploaded: {}", cid);
+                cid_to_bytes32(&cid)?
+            };
+
+            // Handle input - either IPFS CID or local file
+            let input_hash = if input.starts_with("Qm") || input.starts_with("bafy") {
+                println!("Using existing IPFS CID for input: {}", input);
+                cid_to_bytes32(&input)?
+            } else {
+                // Upload local file to IPFS
+                let path = std::path::PathBuf::from(&input);
+                if !path.exists() {
+                    anyhow::bail!("Input file not found: {}", input);
+                }
+                println!("Uploading input to IPFS: {}", input);
+                let data = tokio::fs::read(&path).await?;
+                let cid = storage.put(&data).await?;
+                println!("Input uploaded: {}", cid);
+                cid_to_bytes32(&cid)?
+            };
+
+            // Calculate deadline
+            let deadline = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                + (deadline_hours * 3600);
+
+            // Convert reward to wei
+            let reward_wei = ethers::utils::parse_ether(reward)?;
+
+            // Check minimum reward
+            match blockchain.get_min_reward().await {
+                Ok(min_reward) => {
+                    if reward_wei < min_reward {
+                        anyhow::bail!(
+                            "Reward too low. Minimum: {} ETH",
+                            ethers::utils::format_ether(min_reward)
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not check minimum reward: {}", e);
+                }
+            }
+
+            // Calculate total cost
+            let total_cost = reward_wei * ethers::types::U256::from(nodes);
+
+            println!("{}", "-".repeat(50));
+            println!("Model hash:      0x{}", hex::encode(model_hash));
+            println!("Input hash:      0x{}", hex::encode(input_hash));
+            println!("Reward per node: {} ETH", reward);
+            println!("Required nodes:  {}", nodes);
+            println!("Total cost:      {} ETH", ethers::utils::format_ether(total_cost));
+            println!("Deadline:        {} hours from now", deadline_hours);
+            println!("Requirements:    {}", requirements);
+            println!("{}", "-".repeat(50));
+
+            // Check wallet balance
+            let balance = blockchain.get_eth_balance(wallet.address()).await?;
+            if balance < total_cost {
+                anyhow::bail!(
+                    "Insufficient balance. Required: {} ETH, Available: {} ETH",
+                    ethers::utils::format_ether(total_cost),
+                    ethers::utils::format_ether(balance)
+                );
+            }
+
+            println!("\nSubmitting task to blockchain...");
+
+            match blockchain.submit_task(
+                model_hash,
+                input_hash,
+                &requirements,
+                reward_wei,
+                nodes as u64,
+                deadline,
+                &wallet,
+            ).await {
+                Ok((tx_hash, task_id)) => {
+                    println!("\n{}", "=".repeat(50));
+                    println!("TASK SUBMITTED SUCCESSFULLY!");
+                    println!("{}", "-".repeat(50));
+                    println!("Task ID:     {}", task_id);
+                    println!("TX Hash:     {:?}", tx_hash);
+                    println!("{}", "=".repeat(50));
+                }
+                Err(e) => {
+                    error!("Failed to submit task: {}", e);
+                    anyhow::bail!("Task submission failed: {}", e);
+                }
+            }
         }
+
         cli::TasksSubcommand::Status { task_id } => {
-            println!("Task {} status:", task_id);
-            // TODO: Query task status
+            println!("Querying task #{}...\n", task_id);
+
+            match blockchain.get_task_details(task_id).await {
+                Ok(task) => {
+                    println!("{}", "=".repeat(60));
+                    println!("TASK #{}", task.id);
+                    println!("{}", "-".repeat(60));
+                    println!("Status:          {}", task.status_str());
+                    println!("Mode:            {}", task.mode_str());
+                    println!("Requester:       {:?}", task.requester);
+                    println!("Model hash:      0x{}", hex::encode(task.model_hash));
+                    println!("Input hash:      0x{}", hex::encode(task.input_hash));
+                    println!("Requirements:    {}", task.model_requirements);
+                    println!("Reward/node:     {} ETH", ethers::utils::format_ether(task.reward_per_node));
+                    println!("Nodes:           {} / {} completed", task.completed_nodes, task.required_nodes);
+                    println!("Deadline:        {}", format_timestamp(task.deadline));
+                    println!("Created:         {}", format_timestamp(task.created_at));
+                    println!("{}", "=".repeat(60));
+                }
+                Err(e) => {
+                    println!("Error: Could not find task #{}: {}", task_id, e);
+                }
+            }
+        }
+
+        cli::TasksSubcommand::Mine => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required. Add 'private_key' to config.")?;
+
+            println!("Tasks submitted by {:?}\n", wallet.address());
+
+            let task_count = blockchain.get_task_count().await?;
+            let mut my_tasks = Vec::new();
+
+            for i in 1..=task_count {
+                if let Ok(task) = blockchain.get_task_details(i).await {
+                    if task.requester == wallet.address() {
+                        my_tasks.push(task);
+                    }
+                }
+            }
+
+            if my_tasks.is_empty() {
+                println!("You have not submitted any tasks.");
+                return Ok(());
+            }
+
+            println!("{}", "=".repeat(80));
+            println!("{:<6} {:<12} {:<10} {:<12} {:<10}", "ID", "Reward", "Nodes", "Status", "Completed");
+            println!("{}", "-".repeat(80));
+
+            for task in &my_tasks {
+                println!(
+                    "{:<6} {:<12} {:<10} {:<12} {:<10}",
+                    task.id,
+                    format!("{:.4} ETH", ethers::utils::format_ether(task.reward_per_node)),
+                    task.required_nodes,
+                    task.status_str(),
+                    format!("{}/{}", task.completed_nodes, task.required_nodes)
+                );
+            }
+
+            println!("{}", "=".repeat(80));
+            println!("Total: {} tasks submitted", my_tasks.len());
         }
     }
     Ok(())
+}
+
+/// Convert IPFS CID to bytes32 hash
+fn cid_to_bytes32(cid: &str) -> Result<[u8; 32]> {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(cid.as_bytes());
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    Ok(hash)
+}
+
+/// Format deadline as human-readable string
+fn format_deadline(timestamp: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if timestamp <= now {
+        return "Expired".to_string();
+    }
+
+    let remaining = timestamp - now;
+    if remaining < 3600 {
+        format!("{}m", remaining / 60)
+    } else if remaining < 86400 {
+        format!("{}h", remaining / 3600)
+    } else {
+        format!("{}d", remaining / 86400)
+    }
+}
+
+/// Format Unix timestamp as human-readable string
+fn format_timestamp(timestamp: u64) -> String {
+    use chrono::{DateTime, Utc};
+    let dt = DateTime::<Utc>::from_timestamp(timestamp as i64, 0);
+    match dt {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => format!("{}", timestamp),
+    }
 }
 
 async fn handle_wallet(config: Config, subcommand: cli::WalletSubcommand) -> Result<()> {

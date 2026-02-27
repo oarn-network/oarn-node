@@ -52,25 +52,41 @@ pub enum Commands {
 #[derive(Subcommand, Debug)]
 pub enum TasksSubcommand {
     /// List available tasks
-    List,
+    List {
+        /// Show all tasks (including completed/expired)
+        #[arg(short, long)]
+        all: bool,
+
+        /// Maximum number of tasks to show
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+    },
 
     /// Submit a new task
     Submit {
-        /// IPFS CID of the model
+        /// Path to the model file (will be uploaded to IPFS) or IPFS CID (starting with Qm or bafy)
         #[arg(short, long)]
         model: String,
 
-        /// IPFS CID of the input data
+        /// Path to the input data file (will be uploaded to IPFS) or IPFS CID
         #[arg(short, long)]
         input: String,
 
-        /// Reward per node (in COMP)
+        /// Reward per node in ETH (e.g., 0.001)
         #[arg(short, long)]
         reward: f64,
 
-        /// Number of nodes required
+        /// Number of nodes required for consensus
         #[arg(short, long, default_value = "3")]
         nodes: u32,
+
+        /// Deadline in hours from now (default: 24 hours)
+        #[arg(short, long, default_value = "24")]
+        deadline_hours: u64,
+
+        /// Model requirements as JSON (e.g., '{"framework":"onnx","min_ram":"4GB"}')
+        #[arg(long, default_value = "{}")]
+        requirements: String,
     },
 
     /// Check task status
@@ -78,6 +94,9 @@ pub enum TasksSubcommand {
         /// Task ID
         task_id: u64,
     },
+
+    /// Show tasks submitted by your wallet
+    Mine,
 }
 
 #[derive(Subcommand, Debug)]
