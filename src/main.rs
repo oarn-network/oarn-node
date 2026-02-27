@@ -121,6 +121,12 @@ async fn run_node(config: Config) -> Result<()> {
     // Task polling interval (every 30 seconds)
     let mut task_poll_interval = interval(Duration::from_secs(30));
 
+    // Peer discovery interval (every 60 seconds)
+    let mut peer_discovery_interval = interval(Duration::from_secs(60));
+
+    // Network stats interval (every 2 minutes)
+    let mut stats_interval = interval(Duration::from_secs(120));
+
     // Main event loop
     loop {
         tokio::select! {
@@ -145,6 +151,20 @@ async fn run_node(config: Config) -> Result<()> {
                         error!("Task polling error: {}", e);
                     }
                 }
+            }
+
+            // Periodic peer discovery via DHT
+            _ = peer_discovery_interval.tick() => {
+                debug!("Running periodic peer discovery...");
+                network.find_peers();
+            }
+
+            // Display network stats periodically
+            _ = stats_interval.tick() => {
+                let stats = network.stats();
+                info!("Network: {} connected, {} discovered, bootstrap: {}",
+                      stats.connected_peers, stats.discovered_peers,
+                      if stats.bootstrap_complete { "complete" } else { "pending" });
             }
 
             // Graceful shutdown on Ctrl+C
