@@ -7,14 +7,45 @@ use anyhow::{Context, Result};
 use ethers::{
     prelude::*,
     providers::{Http, Provider, Middleware},
-    types::{Address, U256},
+    types::{Address, U256, TxHash},
+    signers::LocalWallet,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use crate::config::Config;
 use crate::discovery::Discovery;
+
+// Generate contract bindings from ABI
+abigen!(
+    TaskRegistryContract,
+    r#"[
+        function taskCount() external view returns (uint256)
+        function tasks(uint256 taskId) external view returns (uint256 id, address requester, bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 completedNodes, uint256 deadline, uint8 status, uint8 mode, uint256 createdAt)
+        function claimTask(uint256 taskId) external
+        function submitResult(uint256 taskId, bytes32 resultHash) external
+        function hasClaimedTask(uint256 taskId, address node) external view returns (bool)
+        function hasSubmittedResult(uint256 taskId, address node) external view returns (bool)
+        event TaskCreated(uint256 indexed taskId, address indexed requester, bytes32 modelHash, uint256 rewardPerNode, uint256 requiredNodes, uint8 mode)
+        event TaskClaimed(uint256 indexed taskId, address indexed node)
+        event ResultSubmitted(uint256 indexed taskId, address indexed node, bytes32 resultHash)
+        event TaskCompleted(uint256 indexed taskId, uint256 totalRewards)
+        event RewardDistributed(uint256 indexed taskId, address indexed node, uint256 amount)
+    ]"#
+);
+
+// ERC20 token bindings
+abigen!(
+    ERC20Token,
+    r#"[
+        function name() external view returns (string)
+        function symbol() external view returns (string)
+        function decimals() external view returns (uint8)
+        function totalSupply() external view returns (uint256)
+        function balanceOf(address account) external view returns (uint256)
+    ]"#
+);
 
 /// Blockchain events
 #[derive(Debug)]
@@ -35,6 +66,9 @@ pub struct BlockchainClient {
     task_registry_address: Option<Address>,
     token_reward_address: Option<Address>,
     oarn_registry_address: Option<Address>,
+
+    // Contract instance
+    task_registry: Option<TaskRegistryContract<Provider<Http>>>,
 }
 
 impl BlockchainClient {
@@ -72,14 +106,26 @@ impl BlockchainClient {
                 (None, None, None)
             };
 
+        let provider = Arc::new(provider);
+
+        // Initialize contract instance if address is available
+        let task_registry = task_registry_address.map(|addr| {
+            TaskRegistryContract::new(addr, provider.clone())
+        });
+
+        if task_registry.is_some() {
+            info!("TaskRegistry contract initialized at {:?}", task_registry_address);
+        }
+
         Ok(Self {
-            provider: Arc::new(provider),
+            provider,
             chain_id,
             event_rx,
             event_tx,
             task_registry_address,
             token_reward_address,
             oarn_registry_address,
+            task_registry,
         })
     }
 
@@ -107,51 +153,199 @@ impl BlockchainClient {
 
     /// Query available tasks from TaskRegistry
     pub async fn get_available_tasks(&self) -> Result<Vec<TaskInfo>> {
-        let _task_registry = self.task_registry_address
-            .context("TaskRegistry address not discovered")?;
+        let contract = self.task_registry.as_ref()
+            .context("TaskRegistry contract not initialized")?;
 
-        // TODO: Call TaskRegistry.getAvailableTasks()
-        // For now, return empty
-        Ok(vec![])
+        info!("Querying available tasks from TaskRegistry...");
+
+        // Get total task count first
+        let task_count = contract.task_count().call().await
+            .context("Failed to call taskCount")?;
+
+        info!("Total task count on-chain: {}", task_count);
+
+        if task_count.is_zero() {
+            return Ok(vec![]);
+        }
+
+        // Query individual tasks and filter available ones
+        let mut result = Vec::new();
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        info!("Current Unix time: {}", current_time);
+
+        for i in 1..=task_count.as_u64() {
+            match contract.tasks(U256::from(i)).call().await {
+                Ok(task) => {
+                    // task is a tuple: (id, requester, modelHash, inputHash, modelRequirements, rewardPerNode, requiredNodes, completedNodes, deadline, status, mode, createdAt)
+                    let status = task.9; // status field
+                    let deadline = task.8.as_u64(); // deadline field
+
+                    info!("Task #{}: status={}, deadline={}, current_time={}", i, status, deadline, current_time);
+
+                    // Only include Pending (0) or Active (1) tasks that haven't expired
+                    if (status == 0 || status == 1) && deadline > current_time {
+                        info!("Task #{} is available!", i);
+                        result.push(TaskInfo {
+                            id: task.0.as_u64(),
+                            requester: task.1,
+                            model_hash: task.2,
+                            input_hash: task.3,
+                            reward_per_node: task.5,
+                            required_nodes: task.6.as_u32(),
+                            deadline,
+                        });
+                    } else {
+                        info!("Task #{} is NOT available (status={}, expired={})", i, status, deadline <= current_time);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get task #{}: {}", i, e);
+                }
+            }
+        }
+
+        info!("Found {} available tasks", result.len());
+        Ok(result)
+    }
+
+    /// Check if a task has been claimed by this node
+    pub async fn has_claimed_task(&self, task_id: u64, node_address: Address) -> Result<bool> {
+        let contract = self.task_registry.as_ref()
+            .context("TaskRegistry contract not initialized")?;
+
+        let claimed = contract.has_claimed_task(U256::from(task_id), node_address).call().await?;
+        Ok(claimed)
+    }
+
+    /// Check if a result has been submitted by this node
+    pub async fn has_submitted_result(&self, task_id: u64, node_address: Address) -> Result<bool> {
+        let contract = self.task_registry.as_ref()
+            .context("TaskRegistry contract not initialized")?;
+
+        let submitted = contract.has_submitted_result(U256::from(task_id), node_address).call().await?;
+        Ok(submitted)
     }
 
     /// Claim a task
-    pub async fn claim_task(&self, _task_id: u64, _wallet: &LocalWallet) -> Result<TxHash> {
-        let _task_registry = self.task_registry_address
+    pub async fn claim_task(&self, task_id: u64, wallet: &LocalWallet) -> Result<TxHash> {
+        let contract_address = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
-        // TODO: Call TaskRegistry.claimTask(taskId)
-        // For now, return placeholder
-        Err(anyhow::anyhow!("Not implemented"))
+        info!("Claiming task #{}...", task_id);
+
+        // Create a signing client
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = TaskRegistryContract::new(contract_address, client);
+
+        // Create the contract call
+        let call = contract.claim_task(U256::from(task_id));
+
+        // Send and await the transaction
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Claim transaction sent: {:?}", tx_hash);
+
+        // Wait for confirmation
+        let receipt = pending_tx.await?
+            .context("Transaction failed")?;
+
+        info!("Task #{} claimed successfully in block {:?}", task_id, receipt.block_number);
+        Ok(tx_hash)
     }
 
     /// Submit task result
     pub async fn submit_result(
         &self,
-        _task_id: u64,
-        _result_hash: [u8; 32],
-        _wallet: &LocalWallet,
+        task_id: u64,
+        result_hash: [u8; 32],
+        wallet: &LocalWallet,
     ) -> Result<TxHash> {
-        let _task_registry = self.task_registry_address
+        let contract_address = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
-        // TODO: Call TaskRegistry.submitResult(taskId, resultHash)
-        Err(anyhow::anyhow!("Not implemented"))
+        info!("Submitting result for task #{}...", task_id);
+
+        // Create a signing client
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = TaskRegistryContract::new(contract_address, client);
+
+        // Create the contract call
+        let call = contract.submit_result(U256::from(task_id), result_hash);
+
+        // Send and await the transaction
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Submit result transaction sent: {:?}", tx_hash);
+
+        // Wait for confirmation
+        let receipt = pending_tx.await?
+            .context("Transaction failed")?;
+
+        info!("Result submitted for task #{} in block {:?}", task_id, receipt.block_number);
+        Ok(tx_hash)
+    }
+
+    /// Get task count
+    pub async fn get_task_count(&self) -> Result<u64> {
+        let contract = self.task_registry.as_ref()
+            .context("TaskRegistry contract not initialized")?;
+
+        let count = contract.task_count().call().await?;
+        Ok(count.as_u64())
     }
 
     /// Get COMP token balance
-    pub async fn get_comp_balance(&self, _address: Address) -> Result<U256> {
-        let _token_reward = self.token_reward_address
-            .context("TokenReward address not discovered")?;
+    pub async fn get_comp_balance(&self, address: Address) -> Result<U256> {
+        let token_address = self.token_reward_address
+            .context("COMP token address not discovered")?;
 
-        // TODO: Call COMPToken.balanceOf(address)
-        Ok(U256::zero())
+        let token = ERC20Token::new(token_address, self.provider.clone());
+        let balance = token.balance_of(address).call().await?;
+        Ok(balance)
     }
 
     /// Get GOV token balance
-    pub async fn get_gov_balance(&self, _address: Address) -> Result<U256> {
-        // TODO: Implement
+    pub async fn get_gov_balance(&self, address: Address) -> Result<U256> {
+        // GOV token address would need to be discovered/configured
+        // For now, return zero since we don't have the address stored
+        let _ = address;
         Ok(U256::zero())
+    }
+
+    /// Get node's total earnings (ETH rewards from completed tasks)
+    pub async fn get_node_earnings(&self, address: Address) -> Result<NodeEarnings> {
+        let eth_balance = self.get_eth_balance(address).await?;
+        let comp_balance = self.get_comp_balance(address).await.unwrap_or(U256::zero());
+
+        // Count completed tasks by checking which tasks this node has submitted results for
+        let mut tasks_completed = 0u64;
+        let task_count = self.get_task_count().await.unwrap_or(0);
+
+        for task_id in 1..=task_count {
+            if self.has_submitted_result(task_id, address).await.unwrap_or(false) {
+                tasks_completed += 1;
+            }
+        }
+
+        Ok(NodeEarnings {
+            eth_balance,
+            comp_balance,
+            tasks_completed,
+        })
     }
 
     /// Subscribe to contract events
@@ -193,4 +387,12 @@ pub struct TaskInfo {
     pub reward_per_node: U256,
     pub required_nodes: u32,
     pub deadline: u64,
+}
+
+/// Node earnings summary
+#[derive(Debug, Clone)]
+pub struct NodeEarnings {
+    pub eth_balance: U256,
+    pub comp_balance: U256,
+    pub tasks_completed: u64,
 }

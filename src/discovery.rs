@@ -181,6 +181,19 @@ impl Discovery {
             });
         }
 
+        // Load manual contract addresses from config
+        if let Some(contracts) = &self.config.blockchain.contracts {
+            self.core_contracts = Some(CoreContracts {
+                oarn_registry: contracts.oarn_registry.clone().unwrap_or_default(),
+                task_registry: contracts.task_registry.clone().unwrap_or_default(),
+                token_reward: contracts.token_reward.clone().unwrap_or_default(),
+                validator_registry: String::new(),
+                governance: String::new(),
+                gov_token: contracts.gov_token.clone().unwrap_or_default(),
+            });
+            info!("Loaded manual contract addresses from config");
+        }
+
         Ok(())
     }
 

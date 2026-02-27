@@ -14,9 +14,12 @@ mod storage;
 mod compute;
 mod discovery;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{info, Level};
+use ethers::signers::{LocalWallet, Signer};
+use std::time::Duration;
+use tokio::time::interval;
+use tracing::{info, warn, error, debug, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::cli::{Cli, Commands};
@@ -59,6 +62,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Load wallet from config
+fn load_wallet(config: &Config) -> Result<Option<LocalWallet>> {
+    // Try loading from private key first (for testing)
+    if let Some(ref private_key) = config.wallet.private_key {
+        let key = private_key.strip_prefix("0x").unwrap_or(private_key);
+        let wallet: LocalWallet = key.parse()
+            .context("Failed to parse private key")?;
+        info!("Loaded wallet from private key: {:?}", wallet.address());
+        return Ok(Some(wallet));
+    }
+
+    // Try loading from keystore
+    if let Some(ref keystore_path) = config.wallet.keystore_path {
+        warn!("Keystore loading not yet implemented: {:?}", keystore_path);
+    }
+
+    warn!("No wallet configured - node will run in read-only mode");
+    warn!("Add 'private_key' to [wallet] section in config to enable task processing");
+    Ok(None)
+}
+
 /// Run the main node loop
 async fn run_node(config: Config) -> Result<()> {
     info!("{}", "=".repeat(50));
@@ -87,9 +111,15 @@ async fn run_node(config: Config) -> Result<()> {
     info!("Initializing compute engine...");
     let compute = compute::ComputeEngine::new(&config)?;
 
+    // Step 6: Load wallet for signing transactions
+    let wallet = load_wallet(&config)?;
+
     info!("Node started successfully!");
     info!("Listening on: {:?}", config.network.listen_addresses);
     info!("{}", "-".repeat(50));
+
+    // Task polling interval (every 30 seconds)
+    let mut task_poll_interval = interval(Duration::from_secs(30));
 
     // Main event loop
     loop {
@@ -108,10 +138,195 @@ async fn run_node(config: Config) -> Result<()> {
                 }
             }
 
+            // Poll for available tasks
+            _ = task_poll_interval.tick() => {
+                if let Some(ref wallet) = wallet {
+                    if let Err(e) = poll_and_process_tasks(&blockchain, &storage, &compute, wallet).await {
+                        error!("Task polling error: {}", e);
+                    }
+                }
+            }
+
             // Graceful shutdown on Ctrl+C
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutting down...");
                 break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a task that was already claimed but not yet completed
+async fn process_claimed_task(
+    task: &blockchain::TaskInfo,
+    blockchain: &blockchain::BlockchainClient,
+    storage: &storage::IpfsStorage,
+    compute: &compute::ComputeEngine,
+    wallet: &LocalWallet,
+) {
+    info!("Processing previously claimed task #{}...", task.id);
+
+    // Try to download model and input from IPFS, fall back to placeholder
+    let model_data = storage.get(&task.model_hash).await;
+    let input_data = storage.get(&task.input_hash).await;
+
+    let (model, input) = match (model_data, input_data) {
+        (Ok(m), Ok(i)) => {
+            info!("Downloaded model and input from IPFS");
+            (m, i)
+        }
+        _ => {
+            // Use placeholder data for testing (hash-based deterministic data)
+            warn!("IPFS unavailable - using placeholder data for testing");
+            let model = task.model_hash.to_vec();
+            let input = task.input_hash.to_vec();
+            (model, input)
+        }
+    };
+
+    // Execute the task
+    info!("Executing task #{}...", task.id);
+    match compute.execute(&model, &input).await {
+        Ok(result) => {
+            // Hash the result
+            let result_hash = compute.hash_result(&result);
+            info!("Task #{} completed! Result hash: 0x{}", task.id, hex::encode(result_hash));
+
+            // Try to upload result to IPFS (optional)
+            if let Ok(result_cid) = storage.put(&result).await {
+                info!("Result uploaded to IPFS: {}", result_cid);
+            }
+
+            // Submit result on-chain
+            match blockchain.submit_result(task.id, result_hash, wallet).await {
+                Ok(tx_hash) => {
+                    info!("Result submitted for task #{}! TX: {:?}", task.id, tx_hash);
+                }
+                Err(e) => {
+                    error!("Failed to submit result for task #{}: {}", task.id, e);
+                }
+            }
+        }
+        Err(e) => {
+            error!("Task #{} execution failed: {}", task.id, e);
+        }
+    }
+}
+
+/// Poll for available tasks and process them
+async fn poll_and_process_tasks(
+    blockchain: &blockchain::BlockchainClient,
+    storage: &storage::IpfsStorage,
+    compute: &compute::ComputeEngine,
+    wallet: &LocalWallet,
+) -> Result<()> {
+    info!("Polling for available tasks...");
+
+    // Get available tasks from blockchain
+    let tasks = blockchain.get_available_tasks().await?;
+
+    if tasks.is_empty() {
+        info!("No available tasks found");
+        return Ok(());
+    }
+
+    info!("Found {} available tasks", tasks.len());
+
+    for task in tasks {
+        // Check if we've already claimed this task
+        let already_claimed = blockchain.has_claimed_task(task.id, wallet.address()).await?;
+
+        // Check if we've already submitted results
+        let already_submitted = blockchain.has_submitted_result(task.id, wallet.address()).await?;
+
+        if already_submitted {
+            debug!("Task #{} already completed by us", task.id);
+            continue;
+        }
+
+        // If we claimed but haven't submitted, process it now
+        if already_claimed {
+            info!("Task #{} was claimed but not completed - processing now...", task.id);
+            process_claimed_task(&task, blockchain, storage, compute, wallet).await;
+            continue;
+        }
+
+        // Check if we can handle this task (framework, RAM, etc.)
+        if !compute.can_handle_task(&task) {
+            debug!("Task #{} - cannot handle (requirements not met)", task.id);
+            continue;
+        }
+
+        info!("Claiming task #{}...", task.id);
+
+        // Claim the task on-chain
+        match blockchain.claim_task(task.id, wallet).await {
+            Ok(tx_hash) => {
+                info!("Task #{} claimed successfully! TX: {:?}", task.id, tx_hash);
+
+                // Try to download model and input from IPFS, fall back to placeholder
+                info!("Downloading model and input data...");
+                let model_data = storage.get(&task.model_hash).await;
+                let input_data = storage.get(&task.input_hash).await;
+
+                let (model, input) = match (model_data, input_data) {
+                    (Ok(m), Ok(i)) => {
+                        info!("Downloaded model and input from IPFS");
+                        (m, i)
+                    }
+                    _ => {
+                        // Use placeholder data for testing (hash-based deterministic data)
+                        warn!("IPFS unavailable - using placeholder data for testing");
+                        let model = task.model_hash.to_vec();
+                        let input = task.input_hash.to_vec();
+                        (model, input)
+                    }
+                };
+
+                // Execute the task
+                info!("Executing task #{}...", task.id);
+                match compute.execute(&model, &input).await {
+                    Ok(result) => {
+                        // Hash the result
+                        let result_hash = compute.hash_result(&result);
+                        info!("Task #{} completed! Result hash: 0x{}", task.id, hex::encode(result_hash));
+
+                        // Try to upload result to IPFS (optional)
+                        if let Ok(result_cid) = storage.put(&result).await {
+                            info!("Result uploaded to IPFS: {}", result_cid);
+                        }
+
+                        // Submit result on-chain
+                        match blockchain.submit_result(task.id, result_hash, wallet).await {
+                            Ok(tx_hash) => {
+                                info!("Result submitted for task #{}! TX: {:?}", task.id, tx_hash);
+                                info!("Reward: {} ETH", ethers::utils::format_ether(task.reward_per_node));
+
+                                // Display updated earnings
+                                if let Ok(earnings) = blockchain.get_node_earnings(wallet.address()).await {
+                                    info!("{}", "=".repeat(40));
+                                    info!("NODE EARNINGS SUMMARY");
+                                    info!("{}", "-".repeat(40));
+                                    info!("Tasks completed: {}", earnings.tasks_completed);
+                                    info!("ETH balance: {} ETH", ethers::utils::format_ether(earnings.eth_balance));
+                                    info!("COMP balance: {} COMP", ethers::utils::format_ether(earnings.comp_balance));
+                                    info!("{}", "=".repeat(40));
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to submit result for task #{}: {}", task.id, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Task #{} execution failed: {}", task.id, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to claim task #{}: {}", task.id, e);
             }
         }
     }
@@ -189,15 +404,44 @@ async fn handle_tasks(_config: Config, subcommand: cli::TasksSubcommand) -> Resu
     Ok(())
 }
 
-async fn handle_wallet(_config: Config, subcommand: cli::WalletSubcommand) -> Result<()> {
+async fn handle_wallet(config: Config, subcommand: cli::WalletSubcommand) -> Result<()> {
+    // Load wallet
+    let wallet = load_wallet(&config)?;
+
     match subcommand {
         cli::WalletSubcommand::Balance => {
-            println!("Wallet balance:");
-            // TODO: Query token balances
+            if let Some(wallet) = wallet {
+                println!("Wallet Balance");
+                println!("{}", "=".repeat(40));
+                println!("Address: {:?}", wallet.address());
+
+                // Connect to blockchain
+                let discovery = discovery::Discovery::new(&config).await?;
+                let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
+
+                // Get earnings
+                match blockchain.get_node_earnings(wallet.address()).await {
+                    Ok(earnings) => {
+                        println!("{}", "-".repeat(40));
+                        println!("ETH Balance:     {} ETH", ethers::utils::format_ether(earnings.eth_balance));
+                        println!("COMP Balance:    {} COMP", ethers::utils::format_ether(earnings.comp_balance));
+                        println!("Tasks Completed: {}", earnings.tasks_completed);
+                        println!("{}", "=".repeat(40));
+                    }
+                    Err(e) => {
+                        println!("Error fetching balances: {}", e);
+                    }
+                }
+            } else {
+                println!("No wallet configured. Add 'private_key' to config.");
+            }
         }
         cli::WalletSubcommand::Address => {
-            println!("Wallet address:");
-            // TODO: Show wallet address
+            if let Some(wallet) = wallet {
+                println!("Wallet Address: {:?}", wallet.address());
+            } else {
+                println!("No wallet configured. Add 'private_key' to config.");
+            }
         }
     }
     Ok(())

@@ -40,6 +40,10 @@ ethers-contract = "2.0"
 # IPFS
 ipfs-api-backend-hyper = { version = "0.6", features = ["with-hyper-rustls"] }
 
+# ONNX Runtime for AI inference
+ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
+ndarray = "0.16"
+
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 
@@ -54,6 +58,7 @@ thiserror = "1.0"
 # Cryptography
 rand = "0.8"
 sha2 = "0.10"
+sha3 = "0.10"
 hex = "0.4"
 
 # Configuration

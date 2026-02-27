@@ -136,6 +136,19 @@ pub struct BlockchainConfig {
     /// Number of RPC providers to use for redundancy
     #[serde(default = "default_rpc_redundancy")]
     pub rpc_redundancy: usize,
+
+    /// Manual contract addresses (for testing)
+    #[serde(default)]
+    pub contracts: Option<ContractsConfig>,
+}
+
+/// Manual contract addresses configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContractsConfig {
+    pub task_registry: Option<String>,
+    pub oarn_registry: Option<String>,
+    pub token_reward: Option<String>,
+    pub gov_token: Option<String>,
 }
 
 impl Default for BlockchainConfig {
@@ -145,6 +158,7 @@ impl Default for BlockchainConfig {
             rpc_discovery: default_rpc_discovery(),
             manual_rpc_url: None,
             rpc_redundancy: default_rpc_redundancy(),
+            contracts: None,
         }
     }
 }
@@ -248,6 +262,9 @@ pub struct WalletConfig {
     /// Path to encrypted keystore file
     pub keystore_path: Option<PathBuf>,
 
+    /// Private key hex (FOR TESTING ONLY - use keystore in production!)
+    pub private_key: Option<String>,
+
     /// Use HD wallet derivation
     #[serde(default = "default_true")]
     pub use_hd_wallet: bool,
@@ -261,6 +278,7 @@ impl Default for WalletConfig {
     fn default() -> Self {
         Self {
             keystore_path: None,
+            private_key: None,
             use_hd_wallet: true,
             derivation_path: default_derivation_path(),
         }
