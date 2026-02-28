@@ -44,6 +44,7 @@ pub struct RpcProvider {
 pub struct CoreContracts {
     pub oarn_registry: String,
     pub task_registry: String,
+    pub task_registry_v2: String,  // Multi-node consensus version
     pub token_reward: String,
     pub validator_registry: String,
     pub governance: String,
@@ -122,6 +123,7 @@ impl Discovery {
                 self.core_contracts = Some(CoreContracts {
                     oarn_registry: format!("{:?}", address),
                     task_registry: String::new(),
+                    task_registry_v2: String::new(),
                     token_reward: String::new(),
                     validator_registry: String::new(),
                     governance: String::new(),
@@ -381,9 +383,10 @@ impl Discovery {
             self.core_contracts = Some(CoreContracts {
                 oarn_registry: contracts.oarn_registry.clone().unwrap_or_default(),
                 task_registry: contracts.task_registry.clone().unwrap_or_default(),
+                task_registry_v2: contracts.task_registry_v2.clone().unwrap_or_default(),
                 token_reward: contracts.token_reward.clone().unwrap_or_default(),
                 validator_registry: String::new(),
-                governance: String::new(),
+                governance: contracts.governance.clone().unwrap_or_default(),
                 gov_token: contracts.gov_token.clone().unwrap_or_default(),
             });
             info!("Loaded manual contract addresses from config");
@@ -524,6 +527,7 @@ mod tests {
         let contracts = CoreContracts {
             oarn_registry: "0x1234".to_string(),
             task_registry: "0x2345".to_string(),
+            task_registry_v2: "0x2346".to_string(),
             token_reward: "0x3456".to_string(),
             validator_registry: "0x4567".to_string(),
             governance: "0x5678".to_string(),
@@ -532,6 +536,7 @@ mod tests {
 
         assert_eq!(contracts.oarn_registry, "0x1234");
         assert_eq!(contracts.task_registry, "0x2345");
+        assert_eq!(contracts.task_registry_v2, "0x2346");
     }
 
     #[tokio::test]
@@ -688,6 +693,7 @@ mod tests {
         let contracts = CoreContracts {
             oarn_registry: "0x1234".to_string(),
             task_registry: "0x2345".to_string(),
+            task_registry_v2: "0x2346".to_string(),
             token_reward: "0x3456".to_string(),
             validator_registry: "0x4567".to_string(),
             governance: "0x5678".to_string(),

@@ -146,8 +146,10 @@ pub struct BlockchainConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContractsConfig {
     pub task_registry: Option<String>,
+    pub task_registry_v2: Option<String>,
     pub oarn_registry: Option<String>,
     pub token_reward: Option<String>,
+    pub governance: Option<String>,
     pub gov_token: Option<String>,
 }
 
