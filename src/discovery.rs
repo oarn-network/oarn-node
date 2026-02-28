@@ -7,10 +7,19 @@
 //! 3. On-chain registry (OARNRegistry.sol)
 
 use anyhow::{Context, Result};
+use ethers::providers::{Http, Middleware, Provider};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+
+/// Public Ethereum mainnet RPC endpoints for ENS resolution
+const ENS_RPC_ENDPOINTS: &[&str] = &[
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth",
+    "https://ethereum.publicnode.com",
+    "https://1rpc.io/eth",
+];
 
 /// Discovered bootstrap node
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,18 +106,204 @@ impl Discovery {
 
     /// Discover infrastructure via ENS
     async fn discover_via_ens(&mut self) -> Result<()> {
-        info!("Discovering via ENS: {}", self.config.network.discovery.ens_registry);
+        let ens_registry = self.config.network.discovery.ens_registry.clone();
+        info!("Discovering via ENS: {}", ens_registry);
 
-        // In production, this would:
-        // 1. Resolve oarn-registry.eth to get OARNRegistry contract address
-        // 2. Query oarn-bootstrap.eth TXT records for bootstrap nodes
-        // 3. Query oarn-rpc.eth TXT records for RPC providers
+        // Connect to Ethereum mainnet for ENS resolution
+        let provider = self.get_ens_provider().await?;
 
-        // For now, we'll use a public ENS resolver
-        // TODO: Implement actual ENS resolution
+        // 1. Resolve main registry address (e.g., oarn-registry.eth -> contract address)
+        info!("Resolving ENS name: {}", ens_registry);
+        match provider.resolve_name(&ens_registry).await {
+            Ok(address) => {
+                info!("Resolved {} to {:?}", ens_registry, address);
 
-        warn!("ENS discovery not yet implemented, falling back to DHT");
-        Err(anyhow::anyhow!("ENS discovery not implemented"))
+                // Store the resolved address as OARNRegistry
+                self.core_contracts = Some(CoreContracts {
+                    oarn_registry: format!("{:?}", address),
+                    task_registry: String::new(),
+                    token_reward: String::new(),
+                    validator_registry: String::new(),
+                    governance: String::new(),
+                    gov_token: String::new(),
+                });
+            }
+            Err(e) => {
+                warn!("Failed to resolve {}: {}", ens_registry, e);
+            }
+        }
+
+        // 2. Try to resolve RPC providers from ENS TXT records
+        // Format: oarn-rpc.eth -> TXT records with RPC endpoints
+        let rpc_ens = ens_registry.replace("registry", "rpc");
+        if let Ok(rpc_info) = self.resolve_ens_text(&provider, &rpc_ens, "rpc").await {
+            for endpoint in rpc_info.split(',') {
+                let endpoint = endpoint.trim();
+                if !endpoint.is_empty() && endpoint.starts_with("http") {
+                    info!("Discovered RPC from ENS: {}", endpoint);
+                    self.rpc_providers.push(RpcProvider {
+                        endpoint: endpoint.to_string(),
+                        onion_endpoint: None,
+                        stake: 0,
+                        uptime: 10000,
+                    });
+                }
+            }
+        }
+
+        // 3. Try to resolve bootstrap nodes from ENS TXT records
+        // Format: oarn-bootstrap.eth -> TXT records with multiaddrs
+        let bootstrap_ens = ens_registry.replace("registry", "bootstrap");
+        if let Ok(bootstrap_info) = self.resolve_ens_text(&provider, &bootstrap_ens, "nodes").await {
+            for node_info in bootstrap_info.split(';') {
+                if let Some((peer_id, multiaddr)) = self.parse_bootstrap_record(node_info) {
+                    info!("Discovered bootstrap node from ENS: {}", peer_id);
+                    self.bootstrap_nodes.push(BootstrapNode {
+                        peer_id,
+                        multiaddr,
+                        onion_address: None,
+                        i2p_address: None,
+                    });
+                }
+            }
+        }
+
+        // 4. Try to resolve contract addresses from ENS
+        // task-registry.oarn.eth, token-reward.oarn.eth, etc.
+        self.resolve_contract_addresses(&provider, &ens_registry).await;
+
+        // Check if we discovered anything useful
+        if self.rpc_providers.is_empty() && self.bootstrap_nodes.is_empty() {
+            // If no RPC discovered, use the manual fallback if configured
+            if let Some(rpc_url) = &self.config.blockchain.manual_rpc_url {
+                info!("No RPC from ENS, using manual fallback: {}", rpc_url);
+                self.rpc_providers.push(RpcProvider {
+                    endpoint: rpc_url.clone(),
+                    onion_endpoint: None,
+                    stake: 0,
+                    uptime: 10000,
+                });
+            }
+        }
+
+        if self.rpc_providers.is_empty() {
+            Err(anyhow::anyhow!("ENS discovery found no RPC providers"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Get a provider for ENS resolution (Ethereum mainnet)
+    async fn get_ens_provider(&self) -> Result<Provider<Http>> {
+        for endpoint in ENS_RPC_ENDPOINTS {
+            match Provider::<Http>::try_from(*endpoint) {
+                Ok(provider) => {
+                    // Verify connection
+                    if provider.get_block_number().await.is_ok() {
+                        debug!("Connected to ENS RPC: {}", endpoint);
+                        return Ok(provider);
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to connect to {}: {}", endpoint, e);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("Could not connect to any ENS RPC endpoint"))
+    }
+
+    /// Resolve ENS TXT record
+    async fn resolve_ens_text(
+        &self,
+        provider: &Provider<Http>,
+        name: &str,
+        key: &str,
+    ) -> Result<String> {
+        debug!("Resolving ENS TXT record: {} key={}", name, key);
+
+        // ethers-rs doesn't have direct TXT record support, so we use resolve_name
+        // and check if the name resolves. For TXT records, we'd need to call the
+        // resolver contract directly.
+
+        // For now, try to resolve as an address first
+        match provider.resolve_name(name).await {
+            Ok(_) => {
+                // Name exists, but we can't get TXT records directly with ethers-rs
+                // This would require calling the ENS resolver contract's text() function
+                debug!("ENS name {} exists but TXT record lookup not implemented", name);
+                Err(anyhow::anyhow!("TXT record lookup requires direct contract call"))
+            }
+            Err(e) => {
+                debug!("ENS name {} not found: {}", name, e);
+                Err(anyhow::anyhow!("ENS name not found: {}", e))
+            }
+        }
+    }
+
+    /// Parse a bootstrap node record from ENS TXT
+    /// Format: "peer_id@multiaddr" or "/ip4/x.x.x.x/tcp/4001/p2p/12D3KooW..."
+    fn parse_bootstrap_record(&self, record: &str) -> Option<(String, String)> {
+        let record = record.trim();
+
+        // Format 1: peer_id@multiaddr
+        if record.contains('@') {
+            let parts: Vec<&str> = record.splitn(2, '@').collect();
+            if parts.len() == 2 {
+                return Some((parts[0].to_string(), parts[1].to_string()));
+            }
+        }
+
+        // Format 2: Full multiaddr with /p2p/ suffix
+        if record.contains("/p2p/") {
+            let parts: Vec<&str> = record.split("/p2p/").collect();
+            if parts.len() == 2 {
+                return Some((parts[1].to_string(), record.to_string()));
+            }
+        }
+
+        None
+    }
+
+    /// Resolve contract addresses from ENS subdomains
+    async fn resolve_contract_addresses(&mut self, provider: &Provider<Http>, base_domain: &str) {
+        // Extract base domain (e.g., "oarn-registry.eth" -> "oarn.eth" or use as-is)
+        let base = base_domain.replace("-registry", "");
+
+        let contract_names = [
+            ("task-registry", "task_registry"),
+            ("token-reward", "token_reward"),
+            ("validator-registry", "validator_registry"),
+            ("governance", "governance"),
+            ("gov-token", "gov_token"),
+        ];
+
+        for (subdomain, field) in contract_names {
+            let full_name = if base.starts_with("oarn.") {
+                format!("{}.{}", subdomain, base)
+            } else {
+                format!("{}.oarn.eth", subdomain)
+            };
+
+            match provider.resolve_name(&full_name).await {
+                Ok(address) => {
+                    info!("Resolved {} to {:?}", full_name, address);
+                    if let Some(ref mut contracts) = self.core_contracts {
+                        let addr_str = format!("{:?}", address);
+                        match field {
+                            "task_registry" => contracts.task_registry = addr_str,
+                            "token_reward" => contracts.token_reward = addr_str,
+                            "validator_registry" => contracts.validator_registry = addr_str,
+                            "governance" => contracts.governance = addr_str,
+                            "gov_token" => contracts.gov_token = addr_str,
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Could not resolve {}: {}", full_name, e);
+                }
+            }
+        }
     }
 
     /// Discover infrastructure via DHT
