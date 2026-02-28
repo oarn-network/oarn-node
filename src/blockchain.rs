@@ -50,6 +50,36 @@ abigen!(
     ]"#
 );
 
+// GOV token with voting
+abigen!(
+    GOVToken,
+    r#"[
+        function name() external view returns (string)
+        function symbol() external view returns (string)
+        function balanceOf(address account) external view returns (uint256)
+        function getVotes(address account) external view returns (uint256)
+        function delegates(address account) external view returns (address)
+        function delegate(address delegatee) external
+    ]"#
+);
+
+// Governance contract bindings
+abigen!(
+    GovernanceContract,
+    r#"[
+        function proposalCount() external view returns (uint256)
+        function getProposalId(uint256 index) external view returns (uint256)
+        function getProposalSummary(uint256 proposalId) external view returns (string title, string description, address proposer, uint256 startBlock, uint256 endBlock, uint8 status, uint256 forVotes, uint256 againstVotes, uint256 abstainVotes)
+        function state(uint256 proposalId) external view returns (uint8)
+        function hasVoted(uint256 proposalId, address account) external view returns (bool)
+        function castVote(uint256 proposalId, uint8 support) external returns (uint256)
+        function proposeWithMetadata(address[] targets, uint256[] values, bytes[] calldatas, string title, string description) external returns (uint256)
+        function votingDelay() external view returns (uint256)
+        function votingPeriod() external view returns (uint256)
+        function proposalThreshold() external view returns (uint256)
+    ]"#
+);
+
 /// Blockchain events
 #[derive(Debug)]
 pub enum BlockchainEvent {
@@ -69,9 +99,13 @@ pub struct BlockchainClient {
     task_registry_address: Option<Address>,
     token_reward_address: Option<Address>,
     oarn_registry_address: Option<Address>,
+    governance_address: Option<Address>,
+    gov_token_address: Option<Address>,
 
-    // Contract instance
+    // Contract instances
     task_registry: Option<TaskRegistryContract<Provider<Http>>>,
+    governance: Option<GovernanceContract<Provider<Http>>>,
+    gov_token: Option<GOVToken<Provider<Http>>>,
 }
 
 impl BlockchainClient {
@@ -98,26 +132,39 @@ impl BlockchainClient {
         info!("Connected to chain ID: {}", chain_id);
 
         // Get contract addresses from discovery
-        let (task_registry_address, token_reward_address, oarn_registry_address) =
+        let (task_registry_address, token_reward_address, oarn_registry_address, governance_address, gov_token_address) =
             if let Some(contracts) = discovery.get_core_contracts() {
                 (
                     contracts.task_registry.parse().ok(),
                     contracts.token_reward.parse().ok(),
                     contracts.oarn_registry.parse().ok(),
+                    contracts.governance.parse().ok(),
+                    contracts.gov_token.parse().ok(),
                 )
             } else {
-                (None, None, None)
+                (None, None, None, None, None)
             };
 
         let provider = Arc::new(provider);
 
-        // Initialize contract instance if address is available
+        // Initialize contract instances if addresses are available
         let task_registry = task_registry_address.map(|addr| {
             TaskRegistryContract::new(addr, provider.clone())
         });
 
+        let governance = governance_address.map(|addr| {
+            GovernanceContract::new(addr, provider.clone())
+        });
+
+        let gov_token = gov_token_address.map(|addr| {
+            GOVToken::new(addr, provider.clone())
+        });
+
         if task_registry.is_some() {
             info!("TaskRegistry contract initialized at {:?}", task_registry_address);
+        }
+        if governance.is_some() {
+            info!("Governance contract initialized at {:?}", governance_address);
         }
 
         Ok(Self {
@@ -128,7 +175,11 @@ impl BlockchainClient {
             task_registry_address,
             token_reward_address,
             oarn_registry_address,
+            governance_address,
+            gov_token_address,
             task_registry,
+            governance,
+            gov_token,
         })
     }
 
@@ -480,6 +531,224 @@ impl BlockchainClient {
         self.provider = Arc::new(provider);
 
         Ok(())
+    }
+
+    // ============ Governance Functions ============
+
+    /// Get proposal count
+    pub async fn get_proposal_count(&self) -> Result<u64> {
+        let contract = self.governance.as_ref()
+            .context("Governance contract not initialized")?;
+
+        let count = contract.proposal_count().call().await?;
+        Ok(count.as_u64())
+    }
+
+    /// Get proposal by index
+    pub async fn get_proposal(&self, index: u64) -> Result<Proposal> {
+        let contract = self.governance.as_ref()
+            .context("Governance contract not initialized")?;
+
+        let proposal_id = contract.get_proposal_id(U256::from(index)).call().await?;
+        let summary = contract.get_proposal_summary(proposal_id).call().await?;
+
+        Ok(Proposal {
+            id: format!("{}", proposal_id),
+            title: summary.0,
+            description: summary.1,
+            proposer: summary.2,
+            start_block: summary.3.as_u64(),
+            end_block: summary.4.as_u64(),
+            status: summary.5,
+            for_votes: summary.6,
+            against_votes: summary.7,
+            abstain_votes: summary.8,
+        })
+    }
+
+    /// Get all proposals
+    pub async fn get_proposals(&self, limit: u32) -> Result<Vec<Proposal>> {
+        let count = self.get_proposal_count().await?;
+        let mut proposals = Vec::new();
+
+        let start = if count > limit as u64 { count - limit as u64 } else { 0 };
+
+        for i in start..count {
+            match self.get_proposal(i).await {
+                Ok(p) => proposals.push(p),
+                Err(e) => debug!("Failed to get proposal {}: {}", i, e),
+            }
+        }
+
+        Ok(proposals)
+    }
+
+    /// Get voting power
+    pub async fn get_voting_power(&self, address: Address) -> Result<U256> {
+        let contract = self.gov_token.as_ref()
+            .context("GOV token contract not initialized")?;
+
+        let votes = contract.get_votes(address).call().await?;
+        Ok(votes)
+    }
+
+    /// Get GOV token balance
+    pub async fn get_gov_token_balance(&self, address: Address) -> Result<U256> {
+        let contract = self.gov_token.as_ref()
+            .context("GOV token contract not initialized")?;
+
+        let balance = contract.balance_of(address).call().await?;
+        Ok(balance)
+    }
+
+    /// Get current delegate
+    pub async fn get_delegate(&self, address: Address) -> Result<Address> {
+        let contract = self.gov_token.as_ref()
+            .context("GOV token contract not initialized")?;
+
+        let delegate = contract.delegates(address).call().await?;
+        Ok(delegate)
+    }
+
+    /// Delegate voting power
+    pub async fn delegate_votes(&self, to: Address, wallet: &LocalWallet) -> Result<TxHash> {
+        let token_address = self.gov_token_address
+            .context("GOV token address not discovered")?;
+
+        info!("Delegating voting power to {:?}...", to);
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = GOVToken::new(token_address, client);
+        let call = contract.delegate(to);
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Delegation transaction sent: {:?}", tx_hash);
+
+        pending_tx.await?.context("Delegation failed")?;
+        Ok(tx_hash)
+    }
+
+    /// Cast vote on a proposal
+    pub async fn cast_vote(
+        &self,
+        proposal_id: &str,
+        support: u8, // 0 = Against, 1 = For, 2 = Abstain
+        wallet: &LocalWallet,
+    ) -> Result<TxHash> {
+        let gov_address = self.governance_address
+            .context("Governance address not discovered")?;
+
+        let proposal_id_u256 = U256::from_dec_str(proposal_id)
+            .context("Invalid proposal ID")?;
+
+        info!("Casting vote on proposal {}...", proposal_id);
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = GovernanceContract::new(gov_address, client);
+        let call = contract.cast_vote(proposal_id_u256, support);
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Vote transaction sent: {:?}", tx_hash);
+
+        pending_tx.await?.context("Vote failed")?;
+        Ok(tx_hash)
+    }
+
+    /// Check if address has voted on proposal
+    pub async fn has_voted(&self, proposal_id: &str, address: Address) -> Result<bool> {
+        let contract = self.governance.as_ref()
+            .context("Governance contract not initialized")?;
+
+        let proposal_id_u256 = U256::from_dec_str(proposal_id)
+            .context("Invalid proposal ID")?;
+
+        let voted = contract.has_voted(proposal_id_u256, address).call().await?;
+        Ok(voted)
+    }
+
+    /// Create a proposal
+    pub async fn create_proposal(
+        &self,
+        title: &str,
+        description: &str,
+        target: Address,
+        calldata: Vec<u8>,
+        value: U256,
+        wallet: &LocalWallet,
+    ) -> Result<(TxHash, String)> {
+        let gov_address = self.governance_address
+            .context("Governance address not discovered")?;
+
+        info!("Creating proposal: {}", title);
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = GovernanceContract::new(gov_address, client);
+
+        let call = contract.propose_with_metadata(
+            vec![target],
+            vec![value],
+            vec![calldata.into()],
+            title.to_string(),
+            description.to_string(),
+        );
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+        info!("Proposal transaction sent: {:?}", tx_hash);
+
+        let receipt = pending_tx.await?.context("Proposal creation failed")?;
+
+        // Get proposal ID from the new count
+        let count = self.get_proposal_count().await?;
+        let proposal_id = format!("{}", count);
+
+        info!("Proposal created in block {:?}", receipt.block_number);
+        Ok((tx_hash, proposal_id))
+    }
+}
+
+/// Proposal information
+#[derive(Debug, Clone)]
+pub struct Proposal {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub proposer: Address,
+    pub start_block: u64,
+    pub end_block: u64,
+    pub status: u8,
+    pub for_votes: U256,
+    pub against_votes: U256,
+    pub abstain_votes: U256,
+}
+
+impl Proposal {
+    /// Get status as string
+    pub fn status_str(&self) -> &'static str {
+        match self.status {
+            0 => "Pending",
+            1 => "Active",
+            2 => "Canceled",
+            3 => "Defeated",
+            4 => "Succeeded",
+            5 => "Queued",
+            6 => "Expired",
+            7 => "Executed",
+            _ => "Unknown",
+        }
     }
 }
 

@@ -47,6 +47,12 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: ConfigSubcommand,
     },
+
+    /// Governance voting
+    Governance {
+        #[command(subcommand)]
+        subcommand: GovernanceSubcommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,4 +121,66 @@ pub enum ConfigSubcommand {
 
     /// Initialize default configuration
     Init,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GovernanceSubcommand {
+    /// List all proposals
+    List {
+        /// Show only active proposals
+        #[arg(short, long)]
+        active: bool,
+
+        /// Maximum number to show
+        #[arg(short, long, default_value = "10")]
+        limit: u32,
+    },
+
+    /// View proposal details
+    View {
+        /// Proposal ID
+        proposal_id: String,
+    },
+
+    /// Vote on a proposal
+    Vote {
+        /// Proposal ID
+        proposal_id: String,
+
+        /// Vote choice: for, against, abstain
+        #[arg(short, long)]
+        choice: String,
+    },
+
+    /// Check your voting power
+    Power,
+
+    /// Delegate your voting power
+    Delegate {
+        /// Address to delegate to (or "self" to self-delegate)
+        to: String,
+    },
+
+    /// Create a new proposal (requires GOV tokens)
+    Propose {
+        /// Proposal title
+        #[arg(short, long)]
+        title: String,
+
+        /// Proposal description
+        #[arg(short, long)]
+        description: String,
+
+        /// Target contract address
+        #[arg(long)]
+        target: String,
+
+        /// Function calldata (hex)
+        #[arg(long, default_value = "0x")]
+        calldata: String,
+
+        /// ETH value to send
+        #[arg(long, default_value = "0")]
+        value: f64,
+    },
 }

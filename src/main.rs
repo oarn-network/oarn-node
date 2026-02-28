@@ -57,6 +57,9 @@ async fn main() -> Result<()> {
         Commands::Config { subcommand } => {
             handle_config(config, subcommand)?;
         }
+        Commands::Governance { subcommand } => {
+            handle_governance(config, subcommand).await?;
+        }
     }
 
     Ok(())
@@ -744,5 +747,243 @@ fn handle_config(config: Config, subcommand: cli::ConfigSubcommand) -> Result<()
             println!("Created default config at ~/.oarn/config.toml");
         }
     }
+    Ok(())
+}
+
+async fn handle_governance(config: Config, subcommand: cli::GovernanceSubcommand) -> Result<()> {
+    // Initialize discovery and blockchain
+    let discovery = discovery::Discovery::new(&config).await?;
+    let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
+
+    match subcommand {
+        cli::GovernanceSubcommand::List { active, limit } => {
+            println!("Querying governance proposals...\n");
+
+            match blockchain.get_proposals(limit).await {
+                Ok(proposals) => {
+                    if proposals.is_empty() {
+                        println!("No proposals found.");
+                        return Ok(());
+                    }
+
+                    println!("{}", "=".repeat(90));
+                    println!("{:<12} {:<30} {:<12} {:<15} {:<15}", "ID", "Title", "Status", "For", "Against");
+                    println!("{}", "-".repeat(90));
+
+                    for proposal in &proposals {
+                        // Skip non-active if --active flag
+                        if active && proposal.status != 1 {
+                            continue;
+                        }
+
+                        let title = if proposal.title.len() > 28 {
+                            format!("{}...", &proposal.title[..25])
+                        } else {
+                            proposal.title.clone()
+                        };
+
+                        println!(
+                            "{:<12} {:<30} {:<12} {:<15} {:<15}",
+                            &proposal.id[..proposal.id.len().min(10)],
+                            title,
+                            proposal.status_str(),
+                            ethers::utils::format_ether(proposal.for_votes),
+                            ethers::utils::format_ether(proposal.against_votes),
+                        );
+                    }
+
+                    println!("{}", "=".repeat(90));
+                    println!("Total: {} proposals", proposals.len());
+                }
+                Err(e) => {
+                    println!("Error fetching proposals: {}", e);
+                    println!("\nNote: Governance contract may not be deployed yet.");
+                }
+            }
+        }
+
+        cli::GovernanceSubcommand::View { proposal_id } => {
+            println!("Querying proposal {}...\n", proposal_id);
+
+            // For now, get all and find by ID
+            match blockchain.get_proposals(100).await {
+                Ok(proposals) => {
+                    if let Some(proposal) = proposals.iter().find(|p| p.id == proposal_id) {
+                        println!("{}", "=".repeat(70));
+                        println!("PROPOSAL {}", proposal.id);
+                        println!("{}", "-".repeat(70));
+                        println!("Title:       {}", proposal.title);
+                        println!("Status:      {}", proposal.status_str());
+                        println!("Proposer:    {:?}", proposal.proposer);
+                        println!("{}", "-".repeat(70));
+                        println!("Description:");
+                        println!("{}", proposal.description);
+                        println!("{}", "-".repeat(70));
+                        println!("Voting:");
+                        println!("  For:       {} GOV", ethers::utils::format_ether(proposal.for_votes));
+                        println!("  Against:   {} GOV", ethers::utils::format_ether(proposal.against_votes));
+                        println!("  Abstain:   {} GOV", ethers::utils::format_ether(proposal.abstain_votes));
+                        println!("{}", "-".repeat(70));
+                        println!("Timeline:");
+                        println!("  Start Block: {}", proposal.start_block);
+                        println!("  End Block:   {}", proposal.end_block);
+                        println!("{}", "=".repeat(70));
+                    } else {
+                        println!("Proposal {} not found.", proposal_id);
+                    }
+                }
+                Err(e) => {
+                    println!("Error: {}", e);
+                }
+            }
+        }
+
+        cli::GovernanceSubcommand::Vote { proposal_id, choice } => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required to vote. Add 'private_key' to config.")?;
+
+            let support = match choice.to_lowercase().as_str() {
+                "for" | "yes" | "1" => 1u8,
+                "against" | "no" | "0" => 0u8,
+                "abstain" | "2" => 2u8,
+                _ => {
+                    anyhow::bail!("Invalid vote choice. Use: for, against, or abstain");
+                }
+            };
+
+            // Check if already voted
+            if blockchain.has_voted(&proposal_id, wallet.address()).await? {
+                println!("You have already voted on this proposal.");
+                return Ok(());
+            }
+
+            // Check voting power
+            let voting_power = blockchain.get_voting_power(wallet.address()).await?;
+            if voting_power.is_zero() {
+                println!("You have no voting power. Delegate to yourself first:");
+                println!("  oarn-node governance delegate self");
+                return Ok(());
+            }
+
+            println!("Casting vote on proposal {}...", proposal_id);
+            println!("Vote: {}", choice);
+            println!("Voting power: {} GOV", ethers::utils::format_ether(voting_power));
+
+            match blockchain.cast_vote(&proposal_id, support, &wallet).await {
+                Ok(tx_hash) => {
+                    println!("\n{}", "=".repeat(50));
+                    println!("VOTE CAST SUCCESSFULLY!");
+                    println!("TX Hash: {:?}", tx_hash);
+                    println!("{}", "=".repeat(50));
+                }
+                Err(e) => {
+                    error!("Failed to cast vote: {}", e);
+                }
+            }
+        }
+
+        cli::GovernanceSubcommand::Power => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required. Add 'private_key' to config.")?;
+
+            println!("Governance Power for {:?}\n", wallet.address());
+
+            match blockchain.get_gov_token_balance(wallet.address()).await {
+                Ok(balance) => {
+                    println!("GOV Token Balance: {} GOV", ethers::utils::format_ether(balance));
+                }
+                Err(e) => {
+                    println!("Could not fetch GOV balance: {}", e);
+                }
+            }
+
+            match blockchain.get_voting_power(wallet.address()).await {
+                Ok(power) => {
+                    println!("Voting Power:      {} GOV", ethers::utils::format_ether(power));
+                }
+                Err(e) => {
+                    println!("Could not fetch voting power: {}", e);
+                }
+            }
+
+            match blockchain.get_delegate(wallet.address()).await {
+                Ok(delegate) => {
+                    if delegate == wallet.address() {
+                        println!("Delegated to:      Self");
+                    } else if delegate == ethers::types::Address::zero() {
+                        println!("Delegated to:      None (delegate to self to activate voting)");
+                    } else {
+                        println!("Delegated to:      {:?}", delegate);
+                    }
+                }
+                Err(e) => {
+                    println!("Could not fetch delegate: {}", e);
+                }
+            }
+        }
+
+        cli::GovernanceSubcommand::Delegate { to } => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required. Add 'private_key' to config.")?;
+
+            let delegate_to = if to.to_lowercase() == "self" {
+                wallet.address()
+            } else {
+                to.parse().context("Invalid address")?
+            };
+
+            println!("Delegating voting power to {:?}...", delegate_to);
+
+            match blockchain.delegate_votes(delegate_to, &wallet).await {
+                Ok(tx_hash) => {
+                    println!("\n{}", "=".repeat(50));
+                    println!("DELEGATION SUCCESSFUL!");
+                    println!("TX Hash: {:?}", tx_hash);
+                    println!("{}", "=".repeat(50));
+                }
+                Err(e) => {
+                    error!("Failed to delegate: {}", e);
+                }
+            }
+        }
+
+        cli::GovernanceSubcommand::Propose { title, description, target, calldata, value } => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required. Add 'private_key' to config.")?;
+
+            let target_addr: ethers::types::Address = target.parse()
+                .context("Invalid target address")?;
+
+            let calldata_bytes = if calldata == "0x" {
+                vec![]
+            } else {
+                hex::decode(calldata.strip_prefix("0x").unwrap_or(&calldata))
+                    .context("Invalid calldata hex")?
+            };
+
+            let value_wei = ethers::utils::parse_ether(value)?;
+
+            println!("Creating Proposal");
+            println!("{}", "=".repeat(50));
+            println!("Title:       {}", title);
+            println!("Target:      {:?}", target_addr);
+            println!("Value:       {} ETH", value);
+            println!("{}", "-".repeat(50));
+
+            match blockchain.create_proposal(&title, &description, target_addr, calldata_bytes, value_wei, &wallet).await {
+                Ok((tx_hash, proposal_id)) => {
+                    println!("\n{}", "=".repeat(50));
+                    println!("PROPOSAL CREATED!");
+                    println!("Proposal ID: {}", proposal_id);
+                    println!("TX Hash:     {:?}", tx_hash);
+                    println!("{}", "=".repeat(50));
+                }
+                Err(e) => {
+                    error!("Failed to create proposal: {}", e);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
