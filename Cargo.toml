@@ -63,7 +63,7 @@ hex = "0.4"
 
 # Configuration
 directories = "5.0"
-dotenv = "0.15"
+dotenvy = "0.15"
 shellexpand = "3.1"
 dirs = "5.0"
 sysinfo = "0.32"
