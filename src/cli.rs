@@ -103,6 +103,12 @@ pub enum TasksSubcommand {
 
     /// Show tasks submitted by your wallet
     Mine,
+
+    /// Check consensus status for a task
+    Consensus {
+        /// Task ID
+        task_id: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

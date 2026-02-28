@@ -80,6 +80,30 @@ abigen!(
     ]"#
 );
 
+// TaskRegistryV2 with multi-node consensus
+abigen!(
+    TaskRegistryV2Contract,
+    r#"[
+        function taskCount() external view returns (uint256)
+        function tasks(uint256 taskId) external view returns (uint256 id, address requester, bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 claimedCount, uint256 submittedCount, uint256 deadline, uint8 status, uint8 consensusType, uint256 createdAt, bytes32 consensusResult)
+        function getConsensusStatus(uint256 taskId) external view returns (bytes32 winningHash, uint256 winningCount, uint256 totalSubmissions, bool reached, uint256 uniqueResults)
+        function didNodeMatchConsensus(uint256 taskId, address node) external view returns (bool)
+        function hasClaimedTask(uint256 taskId, address node) external view returns (bool)
+        function hasSubmittedResult(uint256 taskId, address node) external view returns (bool)
+        function claimTask(uint256 taskId) external
+        function submitResult(uint256 taskId, bytes32 resultHash) external
+        function submitTask(bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 deadline, uint8 consensusType) external payable returns (uint256)
+        function submitTask(bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 deadline) external payable returns (uint256)
+        event TaskCreated(uint256 indexed taskId, address indexed requester, bytes32 modelHash, uint256 rewardPerNode, uint256 requiredNodes, uint8 consensusType)
+        event TaskClaimed(uint256 indexed taskId, address indexed node)
+        event ResultSubmitted(uint256 indexed taskId, address indexed node, bytes32 resultHash)
+        event ConsensusReached(uint256 indexed taskId, bytes32 consensusHash, uint256 agreeingNodes, uint256 totalNodes)
+        event ConsensusDisputed(uint256 indexed taskId, uint256 uniqueResults, uint256 highestCount)
+        event RewardDistributed(uint256 indexed taskId, address indexed node, uint256 amount, bool matchedConsensus)
+        event TaskCompleted(uint256 indexed taskId, uint256 totalRewards)
+    ]"#
+);
+
 /// Blockchain events
 #[derive(Debug)]
 pub enum BlockchainEvent {
@@ -718,6 +742,62 @@ impl BlockchainClient {
         info!("Proposal created in block {:?}", receipt.block_number);
         Ok((tx_hash, proposal_id))
     }
+
+    // ============ Consensus Functions (TaskRegistryV2) ============
+
+    /// Get consensus status for a task (requires TaskRegistryV2)
+    pub async fn get_consensus_status(&self, task_id: u64) -> Result<ConsensusStatus> {
+        let contract_address = self.task_registry_address
+            .context("TaskRegistry address not discovered")?;
+
+        // Create TaskRegistryV2 contract instance
+        let contract = TaskRegistryV2Contract::new(contract_address, self.provider.clone());
+
+        // Get task details first
+        let task = contract.tasks(U256::from(task_id)).call().await
+            .context("Failed to get task details")?;
+
+        // Check if task exists
+        if task.0.is_zero() {
+            anyhow::bail!("Task not found");
+        }
+
+        // Get consensus status
+        let consensus = contract.get_consensus_status(U256::from(task_id)).call().await
+            .context("Failed to get consensus status - contract may not support consensus")?;
+
+        Ok(ConsensusStatus {
+            task_id,
+            winning_hash: consensus.0,
+            winning_count: consensus.1.as_u64(),
+            total_submissions: consensus.2.as_u64(),
+            unique_results: consensus.4.as_u64(),
+            consensus_reached: consensus.3,
+            task_status: task.10,      // status field
+            consensus_type: task.11,   // consensusType field
+        })
+    }
+
+    /// Get all node results for a task (requires TaskRegistryV2)
+    /// Note: Returns empty Vec if the contract doesn't support this call or no results exist
+    pub async fn get_task_node_results(&self, task_id: u64) -> Result<Vec<NodeResult>> {
+        // The getTaskResults function returns an array of structs which is complex to parse
+        // with ethers-rs abigen. For now, return an empty result and rely on consensus status.
+        // In the future, we could use raw contract calls to decode the array properly.
+        let _ = task_id;
+        Ok(vec![])
+    }
+
+    /// Check if a node matched consensus for a task
+    pub async fn did_node_match_consensus(&self, task_id: u64, node: Address) -> Result<bool> {
+        let contract_address = self.task_registry_address
+            .context("TaskRegistry address not discovered")?;
+
+        let contract = TaskRegistryV2Contract::new(contract_address, self.provider.clone());
+
+        let matched = contract.did_node_match_consensus(U256::from(task_id), node).call().await?;
+        Ok(matched)
+    }
 }
 
 /// Proposal information
@@ -810,4 +890,62 @@ impl TaskDetails {
             _ => "Unknown",
         }
     }
+}
+
+/// Consensus status for a task (TaskRegistryV2)
+#[derive(Debug, Clone)]
+pub struct ConsensusStatus {
+    pub task_id: u64,
+    pub winning_hash: [u8; 32],
+    pub winning_count: u64,
+    pub total_submissions: u64,
+    pub unique_results: u64,
+    pub consensus_reached: bool,
+    pub task_status: u8,
+    pub consensus_type: u8,
+}
+
+impl ConsensusStatus {
+    /// Get consensus type as string
+    pub fn consensus_type_str(&self) -> &'static str {
+        match self.consensus_type {
+            0 => "Majority (>50%)",
+            1 => "SuperMajority (>66%)",
+            2 => "Unanimous (100%)",
+            _ => "Unknown",
+        }
+    }
+
+    /// Get task status as string (V2 statuses)
+    pub fn task_status_str(&self) -> &'static str {
+        match self.task_status {
+            0 => "Pending",
+            1 => "Active",
+            2 => "Consensus",
+            3 => "Completed",
+            4 => "Disputed",
+            5 => "Cancelled",
+            6 => "Expired",
+            _ => "Unknown",
+        }
+    }
+
+    /// Calculate consensus percentage
+    pub fn consensus_percentage(&self) -> f64 {
+        if self.total_submissions == 0 {
+            0.0
+        } else {
+            (self.winning_count as f64 / self.total_submissions as f64) * 100.0
+        }
+    }
+}
+
+/// Node result for a task (TaskRegistryV2)
+#[derive(Debug, Clone)]
+pub struct NodeResult {
+    pub node: Address,
+    pub result_hash: [u8; 32],
+    pub submitted_at: u64,
+    pub matches_consensus: bool,
+    pub rewarded: bool,
 }

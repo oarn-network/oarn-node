@@ -646,6 +646,75 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Resul
             println!("{}", "=".repeat(80));
             println!("Total: {} tasks submitted", my_tasks.len());
         }
+
+        cli::TasksSubcommand::Consensus { task_id } => {
+            println!("Querying consensus status for task #{}...\n", task_id);
+
+            match blockchain.get_consensus_status(task_id).await {
+                Ok(status) => {
+                    println!("{}", "=".repeat(70));
+                    println!("CONSENSUS STATUS - TASK #{}", task_id);
+                    println!("{}", "-".repeat(70));
+                    println!("Task Status:       {}", status.task_status_str());
+                    println!("Consensus Type:    {}", status.consensus_type_str());
+                    println!("{}", "-".repeat(70));
+                    println!("SUBMISSIONS");
+                    println!("  Total:           {}", status.total_submissions);
+                    println!("  Unique Results:  {}", status.unique_results);
+                    println!("{}", "-".repeat(70));
+                    println!("CONSENSUS");
+                    println!("  Reached:         {}", if status.consensus_reached { "YES" } else { "NO" });
+                    println!("  Winning Count:   {}", status.winning_count);
+                    println!("  Agreement:       {:.1}%", status.consensus_percentage());
+
+                    if status.winning_hash != [0u8; 32] {
+                        println!("  Winning Hash:    0x{}", hex::encode(status.winning_hash));
+                    }
+                    println!("{}", "=".repeat(70));
+
+                    // Try to get individual node results
+                    match blockchain.get_task_node_results(task_id).await {
+                        Ok(results) if !results.is_empty() => {
+                            println!("\nNODE RESULTS");
+                            println!("{}", "-".repeat(70));
+                            println!("{:<44} {:<10} {:<10}", "Node", "Consensus", "Rewarded");
+                            println!("{}", "-".repeat(70));
+
+                            for result in &results {
+                                println!(
+                                    "{:<44} {:<10} {:<10}",
+                                    format!("{:?}", result.node)[..42.min(format!("{:?}", result.node).len())].to_string(),
+                                    if result.matches_consensus { "YES" } else { "NO" },
+                                    if result.rewarded { "YES" } else { "NO" }
+                                );
+                            }
+                            println!("{}", "=".repeat(70));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    // Fall back to regular task status if V2 not available
+                    println!("Note: Consensus features require TaskRegistryV2 contract.");
+                    println!("Falling back to basic task status...\n");
+
+                    match blockchain.get_task_details(task_id).await {
+                        Ok(task) => {
+                            println!("{}", "=".repeat(60));
+                            println!("TASK #{}", task.id);
+                            println!("{}", "-".repeat(60));
+                            println!("Status:          {}", task.status_str());
+                            println!("Nodes:           {} / {} completed", task.completed_nodes, task.required_nodes);
+                            println!("Reward/node:     {} ETH", ethers::utils::format_ether(task.reward_per_node));
+                            println!("{}", "=".repeat(60));
+                        }
+                        Err(_) => {
+                            println!("Error: Could not find task #{}: {}", task_id, e);
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
