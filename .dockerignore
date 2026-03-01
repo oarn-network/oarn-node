@@ -1,0 +1,33 @@
+# Build artifacts
+target/
+debug/
+release/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Logs
+*.log
+logs/
+
+# Local config (use volumes instead)
+config.toml
+.env
+
+# Test files
+tests/
+*_test.rs
+
+# Security reports
+security/

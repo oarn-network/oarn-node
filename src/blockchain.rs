@@ -93,7 +93,6 @@ abigen!(
         function claimTask(uint256 taskId) external
         function submitResult(uint256 taskId, bytes32 resultHash) external
         function submitTask(bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 deadline, uint8 consensusType) external payable returns (uint256)
-        function submitTask(bytes32 modelHash, bytes32 inputHash, string modelRequirements, uint256 rewardPerNode, uint256 requiredNodes, uint256 deadline) external payable returns (uint256)
         event TaskCreated(uint256 indexed taskId, address indexed requester, bytes32 modelHash, uint256 rewardPerNode, uint256 requiredNodes, uint8 consensusType)
         event TaskClaimed(uint256 indexed taskId, address indexed node)
         event ResultSubmitted(uint256 indexed taskId, address indexed node, bytes32 resultHash)
@@ -121,6 +120,7 @@ pub struct BlockchainClient {
 
     // Contract addresses (discovered, not hardcoded)
     task_registry_address: Option<Address>,
+    task_registry_v2_address: Option<Address>,  // Multi-node consensus version
     token_reward_address: Option<Address>,
     oarn_registry_address: Option<Address>,
     governance_address: Option<Address>,
@@ -128,6 +128,7 @@ pub struct BlockchainClient {
 
     // Contract instances
     task_registry: Option<TaskRegistryContract<Provider<Http>>>,
+    task_registry_v2: Option<TaskRegistryV2Contract<Provider<Http>>>,  // Multi-node consensus
     governance: Option<GovernanceContract<Provider<Http>>>,
     gov_token: Option<GOVToken<Provider<Http>>>,
 }
@@ -156,17 +157,18 @@ impl BlockchainClient {
         info!("Connected to chain ID: {}", chain_id);
 
         // Get contract addresses from discovery
-        let (task_registry_address, token_reward_address, oarn_registry_address, governance_address, gov_token_address) =
+        let (task_registry_address, task_registry_v2_address, token_reward_address, oarn_registry_address, governance_address, gov_token_address) =
             if let Some(contracts) = discovery.get_core_contracts() {
                 (
                     contracts.task_registry.parse().ok(),
+                    contracts.task_registry_v2.parse().ok(),
                     contracts.token_reward.parse().ok(),
                     contracts.oarn_registry.parse().ok(),
                     contracts.governance.parse().ok(),
                     contracts.gov_token.parse().ok(),
                 )
             } else {
-                (None, None, None, None, None)
+                (None, None, None, None, None, None)
             };
 
         let provider = Arc::new(provider);
@@ -174,6 +176,10 @@ impl BlockchainClient {
         // Initialize contract instances if addresses are available
         let task_registry = task_registry_address.map(|addr| {
             TaskRegistryContract::new(addr, provider.clone())
+        });
+
+        let task_registry_v2 = task_registry_v2_address.map(|addr| {
+            TaskRegistryV2Contract::new(addr, provider.clone())
         });
 
         let governance = governance_address.map(|addr| {
@@ -187,6 +193,9 @@ impl BlockchainClient {
         if task_registry.is_some() {
             info!("TaskRegistry contract initialized at {:?}", task_registry_address);
         }
+        if task_registry_v2.is_some() {
+            info!("TaskRegistryV2 contract initialized at {:?}", task_registry_v2_address);
+        }
         if governance.is_some() {
             info!("Governance contract initialized at {:?}", governance_address);
         }
@@ -197,11 +206,13 @@ impl BlockchainClient {
             event_rx,
             event_tx,
             task_registry_address,
+            task_registry_v2_address,
             token_reward_address,
             oarn_registry_address,
             governance_address,
             gov_token_address,
             task_registry,
+            task_registry_v2,
             governance,
             gov_token,
         })
@@ -229,7 +240,7 @@ impl BlockchainClient {
         Ok(balance)
     }
 
-    /// Query available tasks from TaskRegistry
+    /// Query available tasks from TaskRegistry (V1)
     pub async fn get_available_tasks(&self) -> Result<Vec<TaskInfo>> {
         let contract = self.task_registry.as_ref()
             .context("TaskRegistry contract not initialized")?;
@@ -290,6 +301,70 @@ impl BlockchainClient {
         Ok(result)
     }
 
+    /// Query available tasks from TaskRegistryV2 (multi-node consensus)
+    pub async fn get_available_tasks_v2(&self) -> Result<Vec<TaskInfoV2>> {
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
+
+        info!("Querying available tasks from TaskRegistryV2...");
+
+        let task_count = contract.task_count().call().await
+            .context("Failed to call taskCount")?;
+
+        info!("Total task count on TaskRegistryV2: {}", task_count);
+
+        if task_count.is_zero() {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::new();
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for i in 1..=task_count.as_u64() {
+            match contract.tasks(U256::from(i)).call().await {
+                Ok(task) => {
+                    // V2 tuple: (id, requester, modelHash, inputHash, modelRequirements, rewardPerNode,
+                    //            requiredNodes, claimedCount, submittedCount, deadline, status, consensusType, createdAt, consensusResult)
+                    let status = task.10; // status field (index 10)
+                    let deadline = task.9.as_u64(); // deadline field (index 9)
+
+                    debug!("Task #{}: status={}, deadline={}", i, status, deadline);
+
+                    // Only include Pending (0) or Active (1) tasks that haven't expired
+                    if (status == 0 || status == 1) && deadline > current_time {
+                        info!("Task #{} is available!", i);
+                        result.push(TaskInfoV2 {
+                            id: task.0.as_u64(),
+                            requester: task.1,
+                            model_hash: task.2,
+                            input_hash: task.3,
+                            reward_per_node: task.5,
+                            required_nodes: task.6.as_u32(),
+                            claimed_count: task.7.as_u32(),
+                            submitted_count: task.8.as_u32(),
+                            deadline,
+                            consensus_type: task.11,
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get task #{}: {}", i, e);
+                }
+            }
+        }
+
+        info!("Found {} available tasks on V2", result.len());
+        Ok(result)
+    }
+
+    /// Check if TaskRegistryV2 is available
+    pub fn has_task_registry_v2(&self) -> bool {
+        self.task_registry_v2.is_some()
+    }
+
     /// Check if a task has been claimed by this node
     pub async fn has_claimed_task(&self, task_id: u64, node_address: Address) -> Result<bool> {
         let contract = self.task_registry.as_ref()
@@ -308,31 +383,25 @@ impl BlockchainClient {
         Ok(submitted)
     }
 
-    /// Claim a task
+    /// Claim a task (V1 TaskRegistry)
     pub async fn claim_task(&self, task_id: u64, wallet: &LocalWallet) -> Result<TxHash> {
         let contract_address = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
-        info!("Claiming task #{}...", task_id);
+        info!("Claiming task #{} on TaskRegistry...", task_id);
 
-        // Create a signing client
         let client = Arc::new(SignerMiddleware::new(
             self.provider.clone(),
             wallet.clone().with_chain_id(self.chain_id),
         ));
 
         let contract = TaskRegistryContract::new(contract_address, client);
-
-        // Create the contract call
         let call = contract.claim_task(U256::from(task_id));
-
-        // Send and await the transaction
         let pending_tx = call.send().await?;
         let tx_hash = pending_tx.tx_hash();
 
         info!("Claim transaction sent: {:?}", tx_hash);
 
-        // Wait for confirmation
         let receipt = pending_tx.await?
             .context("Transaction failed")?;
 
@@ -340,7 +409,33 @@ impl BlockchainClient {
         Ok(tx_hash)
     }
 
-    /// Submit task result
+    /// Claim a task on TaskRegistryV2 (multi-node consensus)
+    pub async fn claim_task_v2(&self, task_id: u64, wallet: &LocalWallet) -> Result<TxHash> {
+        let contract_address = self.task_registry_v2_address
+            .context("TaskRegistryV2 address not discovered")?;
+
+        info!("Claiming task #{} on TaskRegistryV2...", task_id);
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = TaskRegistryV2Contract::new(contract_address, client);
+        let call = contract.claim_task(U256::from(task_id));
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Claim V2 transaction sent: {:?}", tx_hash);
+
+        let receipt = pending_tx.await?
+            .context("Transaction failed")?;
+
+        info!("Task #{} claimed on V2 in block {:?}", task_id, receipt.block_number);
+        Ok(tx_hash)
+    }
+
+    /// Submit task result (V1 TaskRegistry)
     pub async fn submit_result(
         &self,
         task_id: u64,
@@ -350,31 +445,76 @@ impl BlockchainClient {
         let contract_address = self.task_registry_address
             .context("TaskRegistry address not discovered")?;
 
-        info!("Submitting result for task #{}...", task_id);
+        info!("Submitting result for task #{} on TaskRegistry...", task_id);
 
-        // Create a signing client
         let client = Arc::new(SignerMiddleware::new(
             self.provider.clone(),
             wallet.clone().with_chain_id(self.chain_id),
         ));
 
         let contract = TaskRegistryContract::new(contract_address, client);
-
-        // Create the contract call
         let call = contract.submit_result(U256::from(task_id), result_hash);
-
-        // Send and await the transaction
         let pending_tx = call.send().await?;
         let tx_hash = pending_tx.tx_hash();
 
         info!("Submit result transaction sent: {:?}", tx_hash);
 
-        // Wait for confirmation
         let receipt = pending_tx.await?
             .context("Transaction failed")?;
 
         info!("Result submitted for task #{} in block {:?}", task_id, receipt.block_number);
         Ok(tx_hash)
+    }
+
+    /// Submit task result on TaskRegistryV2 (multi-node consensus)
+    pub async fn submit_result_v2(
+        &self,
+        task_id: u64,
+        result_hash: [u8; 32],
+        wallet: &LocalWallet,
+    ) -> Result<TxHash> {
+        let contract_address = self.task_registry_v2_address
+            .context("TaskRegistryV2 address not discovered")?;
+
+        info!("Submitting result for task #{} on TaskRegistryV2...", task_id);
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = TaskRegistryV2Contract::new(contract_address, client);
+        let call = contract.submit_result(U256::from(task_id), result_hash);
+        let pending_tx = call.send().await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Submit result V2 transaction sent: {:?}", tx_hash);
+
+        let receipt = pending_tx.await?
+            .context("Transaction failed")?;
+
+        info!("Result submitted on V2 for task #{} in block {:?}", task_id, receipt.block_number);
+
+        // Note: Consensus will be calculated automatically when enough nodes submit
+        Ok(tx_hash)
+    }
+
+    /// Check if a task has been claimed on V2
+    pub async fn has_claimed_task_v2(&self, task_id: u64, node_address: Address) -> Result<bool> {
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
+
+        let claimed = contract.has_claimed_task(U256::from(task_id), node_address).call().await?;
+        Ok(claimed)
+    }
+
+    /// Check if a result has been submitted on V2
+    pub async fn has_submitted_result_v2(&self, task_id: u64, node_address: Address) -> Result<bool> {
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
+
+        let submitted = contract.has_submitted_result(U256::from(task_id), node_address).call().await?;
+        Ok(submitted)
     }
 
     /// Submit a new task to the network
@@ -438,6 +578,73 @@ impl BlockchainClient {
         let task_id = self.get_task_count().await?;
 
         info!("Task created with ID: {}", task_id);
+        Ok((tx_hash, task_id))
+    }
+
+    /// Submit a new task to TaskRegistryV2 (multi-node consensus)
+    pub async fn submit_task_v2(
+        &self,
+        model_hash: [u8; 32],
+        input_hash: [u8; 32],
+        model_requirements: &str,
+        reward_per_node: U256,
+        required_nodes: u64,
+        deadline: u64,
+        consensus_type: u8,  // 0=Majority, 1=SuperMajority, 2=Unanimous
+        wallet: &LocalWallet,
+    ) -> Result<(TxHash, u64)> {
+        let contract_address = self.task_registry_v2_address
+            .context("TaskRegistryV2 address not discovered")?;
+
+        info!("Submitting new task to TaskRegistryV2...");
+        info!("  Model hash: 0x{}", hex::encode(model_hash));
+        info!("  Input hash: 0x{}", hex::encode(input_hash));
+        info!("  Reward per node: {} ETH", ethers::utils::format_ether(reward_per_node));
+        info!("  Required nodes: {}", required_nodes);
+        info!("  Consensus type: {}", match consensus_type {
+            0 => "Majority (>50%)",
+            1 => "SuperMajority (>66%)",
+            2 => "Unanimous (100%)",
+            _ => "Unknown",
+        });
+
+        let total_cost = reward_per_node * U256::from(required_nodes);
+        info!("  Total cost: {} ETH", ethers::utils::format_ether(total_cost));
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let contract = TaskRegistryV2Contract::new(contract_address, client);
+
+        // Submit task with consensus type
+        let call = contract
+            .submit_task(
+                model_hash,
+                input_hash,
+                model_requirements.to_string(),
+                reward_per_node,
+                U256::from(required_nodes),
+                U256::from(deadline),
+                consensus_type,
+            )
+            .value(total_cost);
+
+        let pending_tx = call.send().await
+            .context("Failed to send submitTask V2 transaction")?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("Task V2 submission transaction sent: {:?}", tx_hash);
+
+        let receipt = pending_tx.await?
+            .context("Transaction failed")?;
+
+        info!("Task submitted to V2 in block {:?}", receipt.block_number);
+
+        let task_id = self.get_task_count_v2().await?;
+
+        info!("Task V2 created with ID: {}", task_id);
         Ok((tx_hash, task_id))
     }
 
@@ -747,11 +954,8 @@ impl BlockchainClient {
 
     /// Get consensus status for a task (requires TaskRegistryV2)
     pub async fn get_consensus_status(&self, task_id: u64) -> Result<ConsensusStatus> {
-        let contract_address = self.task_registry_address
-            .context("TaskRegistry address not discovered")?;
-
-        // Create TaskRegistryV2 contract instance
-        let contract = TaskRegistryV2Contract::new(contract_address, self.provider.clone());
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
 
         // Get task details first
         let task = contract.tasks(U256::from(task_id)).call().await
@@ -790,13 +994,20 @@ impl BlockchainClient {
 
     /// Check if a node matched consensus for a task
     pub async fn did_node_match_consensus(&self, task_id: u64, node: Address) -> Result<bool> {
-        let contract_address = self.task_registry_address
-            .context("TaskRegistry address not discovered")?;
-
-        let contract = TaskRegistryV2Contract::new(contract_address, self.provider.clone());
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
 
         let matched = contract.did_node_match_consensus(U256::from(task_id), node).call().await?;
         Ok(matched)
+    }
+
+    /// Get task count from V2
+    pub async fn get_task_count_v2(&self) -> Result<u64> {
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
+
+        let count = contract.task_count().call().await?;
+        Ok(count.as_u64())
     }
 }
 
@@ -832,7 +1043,7 @@ impl Proposal {
     }
 }
 
-/// Task information from blockchain
+/// Task information from blockchain (V1)
 #[derive(Debug, Clone)]
 pub struct TaskInfo {
     pub id: u64,
@@ -842,6 +1053,39 @@ pub struct TaskInfo {
     pub reward_per_node: U256,
     pub required_nodes: u32,
     pub deadline: u64,
+}
+
+/// Task information from TaskRegistryV2 (multi-node consensus)
+#[derive(Debug, Clone)]
+pub struct TaskInfoV2 {
+    pub id: u64,
+    pub requester: Address,
+    pub model_hash: [u8; 32],
+    pub input_hash: [u8; 32],
+    pub reward_per_node: U256,
+    pub required_nodes: u32,
+    pub claimed_count: u32,
+    pub submitted_count: u32,
+    pub deadline: u64,
+    pub consensus_type: u8,
+}
+
+impl TaskInfoV2 {
+    /// Get consensus type as string
+    pub fn consensus_type_str(&self) -> &'static str {
+        match self.consensus_type {
+            0 => "Majority (>50%)",
+            1 => "SuperMajority (>66%)",
+            2 => "Unanimous (100%)",
+            _ => "Unknown",
+        }
+    }
+
+    /// Check if more nodes can claim this task
+    pub fn can_claim(&self) -> bool {
+        // Allow 2x overclaiming as per contract
+        self.claimed_count < self.required_nodes * 2
+    }
 }
 
 /// Node earnings summary

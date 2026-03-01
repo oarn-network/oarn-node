@@ -147,9 +147,14 @@ async fn run_node(config: Config) -> Result<()> {
                 }
             }
 
-            // Poll for available tasks
+            // Poll for available tasks (V1 and V2)
             _ = task_poll_interval.tick() => {
                 if let Some(ref wallet) = wallet {
+                    // Poll V2 tasks first (consensus tasks)
+                    if let Err(e) = poll_and_process_tasks_v2(&blockchain, &storage, &compute, wallet).await {
+                        debug!("V2 Task polling error: {}", e);
+                    }
+                    // Also poll V1 tasks for backwards compatibility
                     if let Err(e) = poll_and_process_tasks(&blockchain, &storage, &compute, wallet).await {
                         error!("Task polling error: {}", e);
                     }
@@ -234,6 +239,126 @@ async fn process_claimed_task(
         }
         Err(e) => {
             error!("Task #{} execution failed: {}", task.id, e);
+        }
+    }
+}
+
+/// Poll for available V2 tasks and process them (multi-node consensus)
+async fn poll_and_process_tasks_v2(
+    blockchain: &blockchain::BlockchainClient,
+    storage: &storage::IpfsStorage,
+    compute: &compute::ComputeEngine,
+    wallet: &LocalWallet,
+) -> Result<()> {
+    if !blockchain.has_task_registry_v2() {
+        return Ok(());
+    }
+
+    info!("Polling for available V2 tasks (consensus)...");
+
+    let tasks = match blockchain.get_available_tasks_v2().await {
+        Ok(t) => t,
+        Err(e) => {
+            debug!("No V2 tasks available: {}", e);
+            return Ok(());
+        }
+    };
+
+    if tasks.is_empty() {
+        debug!("No available V2 tasks found");
+        return Ok(());
+    }
+
+    info!("Found {} available V2 tasks", tasks.len());
+
+    for task in tasks {
+        // Check if we've already claimed this task
+        let already_claimed = blockchain.has_claimed_task_v2(task.id, wallet.address()).await.unwrap_or(false);
+        let already_submitted = blockchain.has_submitted_result_v2(task.id, wallet.address()).await.unwrap_or(false);
+
+        if already_submitted {
+            debug!("V2 Task #{} already completed by us", task.id);
+            continue;
+        }
+
+        // Check if task can still accept claims
+        if !task.can_claim() {
+            debug!("V2 Task #{} - max claims reached", task.id);
+            continue;
+        }
+
+        if already_claimed {
+            info!("V2 Task #{} was claimed but not completed - processing now...", task.id);
+            process_claimed_task_v2(&task, blockchain, storage, compute, wallet).await;
+            continue;
+        }
+
+        info!("Claiming V2 task #{} ({})...", task.id, task.consensus_type_str());
+
+        match blockchain.claim_task_v2(task.id, wallet).await {
+            Ok(tx_hash) => {
+                info!("V2 Task #{} claimed! TX: {:?}", task.id, tx_hash);
+                process_claimed_task_v2(&task, blockchain, storage, compute, wallet).await;
+            }
+            Err(e) => {
+                warn!("Failed to claim V2 task #{}: {}", task.id, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a V2 task that was claimed
+async fn process_claimed_task_v2(
+    task: &blockchain::TaskInfoV2,
+    blockchain: &blockchain::BlockchainClient,
+    storage: &storage::IpfsStorage,
+    compute: &compute::ComputeEngine,
+    wallet: &LocalWallet,
+) {
+    info!("Processing V2 task #{} ({})...", task.id, task.consensus_type_str());
+
+    // Download model and input
+    let model_data = storage.get(&task.model_hash).await;
+    let input_data = storage.get(&task.input_hash).await;
+
+    let (model, input) = match (model_data, input_data) {
+        (Ok(m), Ok(i)) => {
+            info!("Downloaded model and input from IPFS");
+            (m, i)
+        }
+        _ => {
+            warn!("IPFS unavailable - using placeholder data");
+            (task.model_hash.to_vec(), task.input_hash.to_vec())
+        }
+    };
+
+    // Execute
+    info!("Executing V2 task #{}...", task.id);
+    match compute.execute(&model, &input).await {
+        Ok(result) => {
+            let result_hash = compute.hash_result(&result);
+            info!("V2 Task #{} completed! Result hash: 0x{}", task.id, hex::encode(result_hash));
+
+            // Upload result to IPFS
+            if let Ok(result_cid) = storage.put(&result).await {
+                info!("Result uploaded to IPFS: {}", result_cid);
+            }
+
+            // Submit result to V2 contract
+            match blockchain.submit_result_v2(task.id, result_hash, wallet).await {
+                Ok(tx_hash) => {
+                    info!("V2 Result submitted for task #{}! TX: {:?}", task.id, tx_hash);
+                    info!("Consensus will be calculated when {} nodes submit", task.required_nodes);
+                }
+                Err(e) => {
+                    error!("Failed to submit V2 result for task #{}: {}", task.id, e);
+                }
+            }
+        }
+        Err(e) => {
+            error!("V2 Task #{} execution failed: {}", task.id, e);
         }
     }
 }
@@ -462,6 +587,8 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Resul
             nodes,
             deadline_hours,
             requirements,
+            v2,
+            consensus,
         } => {
             // Load wallet
             let wallet = load_wallet(&config)?
@@ -556,26 +683,77 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Resul
 
             println!("\nSubmitting task to blockchain...");
 
-            match blockchain.submit_task(
-                model_hash,
-                input_hash,
-                &requirements,
-                reward_wei,
-                nodes as u64,
-                deadline,
-                &wallet,
-            ).await {
-                Ok((tx_hash, task_id)) => {
-                    println!("\n{}", "=".repeat(50));
-                    println!("TASK SUBMITTED SUCCESSFULLY!");
-                    println!("{}", "-".repeat(50));
-                    println!("Task ID:     {}", task_id);
-                    println!("TX Hash:     {:?}", tx_hash);
-                    println!("{}", "=".repeat(50));
+            if v2 {
+                // Parse consensus type
+                let consensus_type: u8 = match consensus.to_lowercase().as_str() {
+                    "majority" => 0,
+                    "supermajority" | "super" => 1,
+                    "unanimous" | "all" => 2,
+                    _ => {
+                        warn!("Unknown consensus type '{}', using majority", consensus);
+                        0
+                    }
+                };
+
+                println!("Using TaskRegistryV2 with {} consensus", match consensus_type {
+                    0 => "Majority (>50%)",
+                    1 => "SuperMajority (>66%)",
+                    2 => "Unanimous (100%)",
+                    _ => "Unknown",
+                });
+
+                match blockchain.submit_task_v2(
+                    model_hash,
+                    input_hash,
+                    &requirements,
+                    reward_wei,
+                    nodes as u64,
+                    deadline,
+                    consensus_type,
+                    &wallet,
+                ).await {
+                    Ok((tx_hash, task_id)) => {
+                        println!("\n{}", "=".repeat(50));
+                        println!("TASK SUBMITTED TO V2 SUCCESSFULLY!");
+                        println!("{}", "-".repeat(50));
+                        println!("Task ID:     {}", task_id);
+                        println!("TX Hash:     {:?}", tx_hash);
+                        println!("Contract:    TaskRegistryV2");
+                        println!("Consensus:   {}", match consensus_type {
+                            0 => "Majority (>50%)",
+                            1 => "SuperMajority (>66%)",
+                            2 => "Unanimous (100%)",
+                            _ => "Unknown",
+                        });
+                        println!("{}", "=".repeat(50));
+                    }
+                    Err(e) => {
+                        error!("Failed to submit task to V2: {}", e);
+                        anyhow::bail!("Task V2 submission failed: {}", e);
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to submit task: {}", e);
-                    anyhow::bail!("Task submission failed: {}", e);
+            } else {
+                match blockchain.submit_task(
+                    model_hash,
+                    input_hash,
+                    &requirements,
+                    reward_wei,
+                    nodes as u64,
+                    deadline,
+                    &wallet,
+                ).await {
+                    Ok((tx_hash, task_id)) => {
+                        println!("\n{}", "=".repeat(50));
+                        println!("TASK SUBMITTED SUCCESSFULLY!");
+                        println!("{}", "-".repeat(50));
+                        println!("Task ID:     {}", task_id);
+                        println!("TX Hash:     {:?}", tx_hash);
+                        println!("{}", "=".repeat(50));
+                    }
+                    Err(e) => {
+                        error!("Failed to submit task: {}", e);
+                        anyhow::bail!("Task submission failed: {}", e);
+                    }
                 }
             }
         }

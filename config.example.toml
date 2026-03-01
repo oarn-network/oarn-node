@@ -1,0 +1,47 @@
+# OARN Node Configuration Example
+# Copy this to ~/.oarn/config.toml and customize
+
+mode = "standard"
+
+[network]
+listen_addresses = ["/ip4/0.0.0.0/tcp/4001"]
+max_peers = 50
+connection_timeout = 30
+
+[network.discovery]
+method = "manual"
+# For testnet, we use manual discovery
+manual_bootstrap = []
+
+[blockchain]
+chain_id = 421614  # Arbitrum Sepolia (use 42161 for mainnet)
+rpc_discovery = "manual"
+manual_rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
+rpc_redundancy = 1
+
+[blockchain.contracts]
+# Arbitrum Sepolia testnet contract addresses
+task_registry = "0x4Dc9dD73834E94545cF041091e1A743FBD09a60f"
+task_registry_v2 = "0x7b4898aDf69447d6ED3d62F6917CE10bD6519562"
+oarn_registry = "0x1efe74fB6cC3D491abF50E27e05C8917E8811dac"
+token_reward = "0x24249A523A251E38CB0001daBd54DD44Ea8f1838"
+gov_token = "0xB97eDD49C225d2c43e7203aB9248cAbED2B268d3"
+
+[storage]
+ipfs_api = "http://ipfs:5001"  # Use 'ipfs' for docker-compose, '127.0.0.1' for local
+cache_dir = "/data/cache"
+max_cache_mb = 5000
+
+[compute]
+max_ram_mb = 8192
+frameworks = ["onnx"]
+concurrent_tasks = 1
+
+[privacy]
+tor_enabled = false
+padding_enabled = false
+rotate_peers = false
+
+[wallet]
+# IMPORTANT: Set via OARN_PRIVATE_KEY environment variable instead of here
+# private_key = "0x..."

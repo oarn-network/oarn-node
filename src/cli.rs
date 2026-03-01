@@ -93,6 +93,14 @@ pub enum TasksSubcommand {
         /// Model requirements as JSON (e.g., '{"framework":"onnx","min_ram":"4GB"}')
         #[arg(long, default_value = "{}")]
         requirements: String,
+
+        /// Use TaskRegistryV2 with multi-node consensus
+        #[arg(long)]
+        v2: bool,
+
+        /// Consensus type for V2: majority (>50%), supermajority (>66%), unanimous (100%)
+        #[arg(long, default_value = "majority")]
+        consensus: String,
     },
 
     /// Check task status
