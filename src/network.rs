@@ -410,6 +410,27 @@ impl P2PNetwork {
             bootstrap_complete: self.bootstrap_complete,
         }
     }
+
+    /// Get list of connected peers with info
+    pub fn connected_peers(&self) -> Vec<PeerInfo> {
+        self.swarm
+            .connected_peers()
+            .map(|peer_id| {
+                let addresses: Vec<Multiaddr> = self.swarm
+                    .behaviour()
+                    .kademlia
+                    .addresses_of_peer(peer_id)
+                    .into_iter()
+                    .collect();
+
+                PeerInfo {
+                    id: *peer_id,
+                    addresses,
+                    connected_since: 0, // Would need additional tracking
+                }
+            })
+            .collect()
+    }
 }
 
 /// Network statistics
@@ -418,4 +439,12 @@ pub struct NetworkStats {
     pub connected_peers: usize,
     pub discovered_peers: usize,
     pub bootstrap_complete: bool,
+}
+
+/// Peer information
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub id: PeerId,
+    pub addresses: Vec<Multiaddr>,
+    pub connected_since: u64,
 }

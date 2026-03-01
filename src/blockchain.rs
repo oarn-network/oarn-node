@@ -1009,6 +1009,80 @@ impl BlockchainClient {
         let count = contract.task_count().call().await?;
         Ok(count.as_u64())
     }
+
+    /// Get detailed task information from V2
+    pub async fn get_task_details_v2(&self, task_id: u64) -> Result<TaskInfoV2> {
+        let contract = self.task_registry_v2.as_ref()
+            .context("TaskRegistryV2 contract not initialized")?;
+
+        let task = contract.tasks(U256::from(task_id)).call().await
+            .context("Failed to get task details")?;
+
+        if task.0.is_zero() {
+            anyhow::bail!("Task not found");
+        }
+
+        Ok(TaskInfoV2 {
+            id: task.0.as_u64(),
+            requester: task.1,
+            model_hash: task.2,
+            input_hash: task.3,
+            reward_per_node: task.5,
+            required_nodes: task.6.as_u32(),
+            claimed_count: task.7.as_u32(),
+            submitted_count: task.8.as_u32(),
+            deadline: task.9.as_u64(),
+            consensus_type: task.11,
+        })
+    }
+
+    /// Send ETH to an address
+    pub async fn send_eth(&self, to: Address, amount: U256, wallet: &LocalWallet) -> Result<TxHash> {
+        info!("Sending {} ETH to {:?}...", ethers::utils::format_ether(amount), to);
+
+        let client = Arc::new(SignerMiddleware::new(
+            self.provider.clone(),
+            wallet.clone().with_chain_id(self.chain_id),
+        ));
+
+        let tx = TransactionRequest::new()
+            .to(to)
+            .value(amount);
+
+        let pending_tx = client.send_transaction(tx, None).await
+            .context("Failed to send ETH transaction")?;
+        let tx_hash = pending_tx.tx_hash();
+
+        info!("ETH transfer transaction sent: {:?}", tx_hash);
+
+        pending_tx.await?.context("ETH transfer failed")?;
+        Ok(tx_hash)
+    }
+
+    /// Cancel a task (V1 - if supported by contract)
+    pub async fn cancel_task(&self, task_id: u64, _wallet: &LocalWallet) -> Result<TxHash> {
+        // V1 TaskRegistry may not support cancellation
+        // Return an error for now
+        let _ = task_id;
+        anyhow::bail!("Task cancellation not supported on TaskRegistry V1. Use V2 with --v2 flag.")
+    }
+
+    /// Cancel a task (V2 - if supported by contract)
+    pub async fn cancel_task_v2(&self, task_id: u64, _wallet: &LocalWallet) -> Result<TxHash> {
+        // TaskRegistryV2 may support cancellation if no nodes have claimed
+        // For now, return an error since the ABI doesn't include cancel
+        let _ = task_id;
+        anyhow::bail!("Task cancellation not yet implemented in TaskRegistryV2")
+    }
+
+    /// Get transaction history for an address
+    /// Note: This requires an indexer service - returns empty for now
+    pub async fn get_transaction_history(&self, address: Address, limit: u32) -> Result<Vec<TransactionInfo>> {
+        // Transaction history requires an indexer like Etherscan/Arbiscan API
+        // or running our own indexer. For now, return empty.
+        let _ = (address, limit);
+        Ok(vec![])
+    }
 }
 
 /// Proposal information
@@ -1192,4 +1266,14 @@ pub struct NodeResult {
     pub submitted_at: u64,
     pub matches_consensus: bool,
     pub rewarded: bool,
+}
+
+/// Transaction info for history
+#[derive(Debug, Clone)]
+pub struct TransactionInfo {
+    pub hash: String,
+    pub from: String,
+    pub to: String,
+    pub value: String,
+    pub timestamp: u64,
 }

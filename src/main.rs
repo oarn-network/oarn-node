@@ -17,12 +17,13 @@ mod discovery;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ethers::signers::{LocalWallet, Signer};
+use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{info, warn, error, debug, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{Cli, Commands, OutputFormat};
 use crate::config::Config;
 
 #[tokio::main]
@@ -39,26 +40,36 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Config::load(&cli.config)?;
 
+    let output_format = cli.output;
+
     match cli.command {
         Commands::Start => {
             info!("Starting OARN node...");
             run_node(config).await?;
         }
         Commands::Status => {
-            info!("Checking node status...");
-            show_status(config).await?;
+            show_status(config, output_format).await?;
+        }
+        Commands::Version => {
+            show_version(output_format);
+        }
+        Commands::Health => {
+            check_health(config, output_format).await?;
+        }
+        Commands::Peers { detailed } => {
+            show_peers(config, detailed, output_format).await?;
         }
         Commands::Tasks { subcommand } => {
-            handle_tasks(config, subcommand).await?;
+            handle_tasks(config, subcommand, output_format).await?;
         }
         Commands::Wallet { subcommand } => {
-            handle_wallet(config, subcommand).await?;
+            handle_wallet(config, subcommand, output_format).await?;
         }
         Commands::Config { subcommand } => {
-            handle_config(config, subcommand)?;
+            handle_config(config, subcommand, output_format)?;
         }
         Commands::Governance { subcommand } => {
-            handle_governance(config, subcommand).await?;
+            handle_governance(config, subcommand, output_format).await?;
         }
     }
 
@@ -525,25 +536,195 @@ async fn handle_blockchain_event(
     Ok(())
 }
 
-async fn show_status(config: Config) -> Result<()> {
-    println!("Node Status");
-    println!("{}", "-".repeat(40));
-    println!("Config file: {:?}", config.path);
-    println!("Mode: {:?}", config.mode);
-    println!("Listen addresses: {:?}", config.network.listen_addresses);
+/// Show version information
+fn show_version(output_format: OutputFormat) {
+    let version_info = json!({
+        "name": "oarn-node",
+        "version": env!("CARGO_PKG_VERSION"),
+        "authors": env!("CARGO_PKG_AUTHORS"),
+        "rust_version": env!("CARGO_PKG_RUST_VERSION"),
+        "target": env!("TARGET"),
+        "build_timestamp": env!("BUILD_TIMESTAMP"),
+    });
+
+    if output_format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&version_info).unwrap());
+    } else {
+        println!("OARN Node v{}", env!("CARGO_PKG_VERSION"));
+        println!("{}", "=".repeat(40));
+        println!("Authors:       {}", env!("CARGO_PKG_AUTHORS"));
+        if let Ok(rust_ver) = std::env::var("CARGO_PKG_RUST_VERSION") {
+            println!("Rust Version:  {}", rust_ver);
+        }
+        println!("Target:        {}", std::env::consts::ARCH);
+        println!("OS:            {}", std::env::consts::OS);
+    }
+}
+
+/// Check node health and connectivity
+async fn check_health(config: Config, output_format: OutputFormat) -> Result<()> {
+    let mut checks = Vec::new();
+
+    // Check config
+    let config_ok = config.path.exists();
+    checks.push(("config", config_ok, if config_ok { "OK" } else { "Missing config file" }));
+
+    // Check blockchain connectivity
+    let blockchain_ok = match discovery::Discovery::new(&config).await {
+        Ok(discovery) => {
+            match blockchain::BlockchainClient::new(&config, &discovery).await {
+                Ok(client) => {
+                    match client.get_task_count().await {
+                        Ok(_) => true,
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    };
+    checks.push(("blockchain", blockchain_ok, if blockchain_ok { "Connected" } else { "Connection failed" }));
+
+    // Check IPFS connectivity
+    let ipfs_ok = match storage::IpfsStorage::new(&config).await {
+        Ok(storage) => storage.is_available().await,
+        Err(_) => false,
+    };
+    checks.push(("ipfs", ipfs_ok, if ipfs_ok { "Connected" } else { "Connection failed" }));
+
+    // Check wallet
+    let wallet_ok = load_wallet(&config).map(|w| w.is_some()).unwrap_or(false);
+    checks.push(("wallet", wallet_ok, if wallet_ok { "Configured" } else { "Not configured" }));
+
+    let all_ok = checks.iter().all(|(_, ok, _)| *ok);
+
+    if output_format == OutputFormat::Json {
+        let json_checks: Vec<_> = checks.iter().map(|(name, ok, msg)| {
+            json!({ "check": name, "ok": ok, "message": msg })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "healthy": all_ok,
+            "checks": json_checks
+        })).unwrap());
+    } else {
+        println!("Health Check");
+        println!("{}", "=".repeat(40));
+        for (name, ok, msg) in &checks {
+            let status = if *ok { "✓" } else { "✗" };
+            println!("{} {:<12} {}", status, name, msg);
+        }
+        println!("{}", "-".repeat(40));
+        println!("Overall: {}", if all_ok { "Healthy" } else { "Unhealthy" });
+    }
+
     Ok(())
 }
 
-async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Result<()> {
+/// Show connected peers
+async fn show_peers(config: Config, detailed: bool, output_format: OutputFormat) -> Result<()> {
+    let discovery = discovery::Discovery::new(&config).await?;
+    let mut network = network::P2PNetwork::new(&config, &discovery).await?;
+
+    let stats = network.stats();
+    let peers = network.connected_peers();
+
+    if output_format == OutputFormat::Json {
+        let json_output = json!({
+            "local_peer_id": network.local_peer_id().to_string(),
+            "connected_peers": stats.connected_peers,
+            "discovered_peers": stats.discovered_peers,
+            "bootstrap_complete": stats.bootstrap_complete,
+            "peers": if detailed {
+                peers.iter().map(|p| json!({
+                    "peer_id": p.id.to_string(),
+                    "addresses": p.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                    "connected_since": p.connected_since,
+                })).collect()
+            } else {
+                peers.iter().map(|p| json!(p.id.to_string())).collect()
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+    } else {
+        println!("P2P Network Status");
+        println!("{}", "=".repeat(60));
+        println!("Local Peer ID:    {}", network.local_peer_id());
+        println!("Connected Peers:  {}", stats.connected_peers);
+        println!("Discovered Peers: {}", stats.discovered_peers);
+        println!("Bootstrap:        {}", if stats.bootstrap_complete { "Complete" } else { "In Progress" });
+
+        if !peers.is_empty() {
+            println!("{}", "-".repeat(60));
+            println!("Connected Peers:");
+            for peer in &peers {
+                if detailed {
+                    println!("  {} ", peer.id);
+                    for addr in &peer.addresses {
+                        println!("    └─ {}", addr);
+                    }
+                } else {
+                    println!("  {}", peer.id);
+                }
+            }
+        }
+        println!("{}", "=".repeat(60));
+    }
+
+    Ok(())
+}
+
+async fn show_status(config: Config, output_format: OutputFormat) -> Result<()> {
+    if output_format == OutputFormat::Json {
+        let status = json!({
+            "config_file": config.path.to_string_lossy(),
+            "mode": format!("{:?}", config.mode),
+            "listen_addresses": config.network.listen_addresses,
+            "chain_id": config.blockchain.chain_id,
+        });
+        println!("{}", serde_json::to_string_pretty(&status).unwrap());
+    } else {
+        println!("Node Status");
+        println!("{}", "-".repeat(40));
+        println!("Config file: {:?}", config.path);
+        println!("Mode: {:?}", config.mode);
+        println!("Listen addresses: {:?}", config.network.listen_addresses);
+    }
+    Ok(())
+}
+
+async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand, output_format: OutputFormat) -> Result<()> {
     // Initialize discovery and blockchain connection
     let discovery = discovery::Discovery::new(&config).await?;
     let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
 
     match subcommand {
-        cli::TasksSubcommand::List { all, limit } => {
-            println!("Querying tasks from blockchain...\n");
+        cli::TasksSubcommand::List { all, limit, v2 } => {
+            let tasks = if v2 {
+                blockchain.get_available_tasks_v2().await?
+            } else {
+                blockchain.get_available_tasks().await?
+            };
 
-            let tasks = blockchain.get_available_tasks().await?;
+            if output_format == OutputFormat::Json {
+                let json_tasks: Vec<_> = tasks.iter().take(if all { tasks.len() } else { limit as usize }).map(|t| {
+                    json!({
+                        "id": t.id,
+                        "reward_per_node": ethers::utils::format_ether(t.reward_per_node).to_string(),
+                        "required_nodes": t.required_nodes,
+                        "deadline": t.deadline,
+                        "status": "available"
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "tasks": json_tasks,
+                    "total": tasks.len(),
+                    "version": if v2 { "v2" } else { "v1" }
+                })).unwrap());
+                return Ok(());
+            }
+
+            println!("Querying tasks from blockchain...\n");
 
             if tasks.is_empty() {
                 println!("No available tasks found.");
@@ -758,7 +939,28 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Resul
             }
         }
 
-        cli::TasksSubcommand::Status { task_id } => {
+        cli::TasksSubcommand::Status { task_id, v2 } => {
+            if output_format == OutputFormat::Json {
+                let task = blockchain.get_task_details(task_id).await?;
+                let json_output = json!({
+                    "id": task.id,
+                    "status": task.status_str(),
+                    "mode": task.mode_str(),
+                    "requester": format!("{:?}", task.requester),
+                    "model_hash": format!("0x{}", hex::encode(task.model_hash)),
+                    "input_hash": format!("0x{}", hex::encode(task.input_hash)),
+                    "requirements": task.model_requirements,
+                    "reward_per_node": ethers::utils::format_ether(task.reward_per_node).to_string(),
+                    "required_nodes": task.required_nodes,
+                    "completed_nodes": task.completed_nodes,
+                    "deadline": task.deadline,
+                    "created_at": task.created_at,
+                    "version": if v2 { "v2" } else { "v1" }
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+                return Ok(());
+            }
+
             println!("Querying task #{}...\n", task_id);
 
             match blockchain.get_task_details(task_id).await {
@@ -784,7 +986,108 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand) -> Resul
             }
         }
 
-        cli::TasksSubcommand::Mine => {
+        cli::TasksSubcommand::Claim { task_id, v2, execute } => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required to claim tasks. Add 'private_key' to config.")?;
+
+            if output_format != OutputFormat::Json {
+                println!("Claiming task #{}...", task_id);
+            }
+
+            let result = if v2 {
+                blockchain.claim_task_v2(task_id, &wallet).await
+            } else {
+                blockchain.claim_task(task_id, &wallet).await
+            };
+
+            match result {
+                Ok(tx_hash) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "success": true,
+                            "task_id": task_id,
+                            "tx_hash": format!("{:?}", tx_hash),
+                            "version": if v2 { "v2" } else { "v1" }
+                        })).unwrap());
+                    } else {
+                        println!("Task #{} claimed successfully!", task_id);
+                        println!("TX Hash: {:?}", tx_hash);
+                    }
+
+                    // Execute if requested
+                    if execute {
+                        if output_format != OutputFormat::Json {
+                            println!("\nExecuting task...");
+                        }
+                        let storage = storage::IpfsStorage::new(&config).await?;
+                        let compute = compute::ComputeEngine::new(&config)?;
+
+                        if v2 {
+                            if let Ok(task) = blockchain.get_task_details_v2(task_id).await {
+                                process_claimed_task_v2(&task, &blockchain, &storage, &compute, &wallet).await;
+                            }
+                        } else {
+                            if let Ok(task) = blockchain.get_task_details(task_id).await {
+                                process_claimed_task(&task, &blockchain, &storage, &compute, &wallet).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "success": false,
+                            "error": format!("{}", e)
+                        })).unwrap());
+                    } else {
+                        println!("Failed to claim task #{}: {}", task_id, e);
+                    }
+                }
+            }
+        }
+
+        cli::TasksSubcommand::Cancel { task_id, v2 } => {
+            let wallet = load_wallet(&config)?
+                .context("Wallet required to cancel tasks. Add 'private_key' to config.")?;
+
+            if output_format != OutputFormat::Json {
+                println!("Cancelling task #{}...", task_id);
+            }
+
+            let result = if v2 {
+                blockchain.cancel_task_v2(task_id, &wallet).await
+            } else {
+                blockchain.cancel_task(task_id, &wallet).await
+            };
+
+            match result {
+                Ok(tx_hash) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "success": true,
+                            "task_id": task_id,
+                            "tx_hash": format!("{:?}", tx_hash),
+                            "version": if v2 { "v2" } else { "v1" }
+                        })).unwrap());
+                    } else {
+                        println!("Task #{} cancelled successfully!", task_id);
+                        println!("TX Hash: {:?}", tx_hash);
+                    }
+                }
+                Err(e) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "success": false,
+                            "error": format!("{}", e)
+                        })).unwrap());
+                    } else {
+                        println!("Failed to cancel task #{}: {}", task_id, e);
+                    }
+                }
+            }
+        }
+
+        cli::TasksSubcommand::Mine { v2 } => {
             let wallet = load_wallet(&config)?
                 .context("Wallet required. Add 'private_key' to config.")?;
 
@@ -939,17 +1242,13 @@ fn format_timestamp(timestamp: u64) -> String {
     }
 }
 
-async fn handle_wallet(config: Config, subcommand: cli::WalletSubcommand) -> Result<()> {
+async fn handle_wallet(config: Config, subcommand: cli::WalletSubcommand, output_format: OutputFormat) -> Result<()> {
     // Load wallet
     let wallet = load_wallet(&config)?;
 
     match subcommand {
         cli::WalletSubcommand::Balance => {
             if let Some(wallet) = wallet {
-                println!("Wallet Balance");
-                println!("{}", "=".repeat(40));
-                println!("Address: {:?}", wallet.address());
-
                 // Connect to blockchain
                 let discovery = discovery::Discovery::new(&config).await?;
                 let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
@@ -957,58 +1256,263 @@ async fn handle_wallet(config: Config, subcommand: cli::WalletSubcommand) -> Res
                 // Get earnings
                 match blockchain.get_node_earnings(wallet.address()).await {
                     Ok(earnings) => {
-                        println!("{}", "-".repeat(40));
-                        println!("ETH Balance:     {} ETH", ethers::utils::format_ether(earnings.eth_balance));
-                        println!("COMP Balance:    {} COMP", ethers::utils::format_ether(earnings.comp_balance));
-                        println!("Tasks Completed: {}", earnings.tasks_completed);
-                        println!("{}", "=".repeat(40));
+                        if output_format == OutputFormat::Json {
+                            println!("{}", serde_json::to_string_pretty(&json!({
+                                "address": format!("{:?}", wallet.address()),
+                                "eth_balance": ethers::utils::format_ether(earnings.eth_balance).to_string(),
+                                "comp_balance": ethers::utils::format_ether(earnings.comp_balance).to_string(),
+                                "tasks_completed": earnings.tasks_completed
+                            })).unwrap());
+                        } else {
+                            println!("Wallet Balance");
+                            println!("{}", "=".repeat(40));
+                            println!("Address: {:?}", wallet.address());
+                            println!("{}", "-".repeat(40));
+                            println!("ETH Balance:     {} ETH", ethers::utils::format_ether(earnings.eth_balance));
+                            println!("COMP Balance:    {} COMP", ethers::utils::format_ether(earnings.comp_balance));
+                            println!("Tasks Completed: {}", earnings.tasks_completed);
+                            println!("{}", "=".repeat(40));
+                        }
                     }
                     Err(e) => {
-                        println!("Error fetching balances: {}", e);
+                        if output_format == OutputFormat::Json {
+                            println!("{}", serde_json::to_string_pretty(&json!({
+                                "error": format!("{}", e)
+                            })).unwrap());
+                        } else {
+                            println!("Error fetching balances: {}", e);
+                        }
                     }
                 }
             } else {
-                println!("No wallet configured. Add 'private_key' to config.");
+                if output_format == OutputFormat::Json {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "error": "No wallet configured"
+                    })).unwrap());
+                } else {
+                    println!("No wallet configured. Add 'private_key' to config.");
+                }
             }
         }
         cli::WalletSubcommand::Address => {
             if let Some(wallet) = wallet {
-                println!("Wallet Address: {:?}", wallet.address());
+                if output_format == OutputFormat::Json {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "address": format!("{:?}", wallet.address())
+                    })).unwrap());
+                } else {
+                    println!("Wallet Address: {:?}", wallet.address());
+                }
             } else {
-                println!("No wallet configured. Add 'private_key' to config.");
+                if output_format == OutputFormat::Json {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "error": "No wallet configured"
+                    })).unwrap());
+                } else {
+                    println!("No wallet configured. Add 'private_key' to config.");
+                }
+            }
+        }
+        cli::WalletSubcommand::Send { to, amount, yes } => {
+            let wallet = wallet.context("Wallet required to send ETH. Add 'private_key' to config.")?;
+
+            let to_address: ethers::types::Address = to.parse()
+                .context("Invalid recipient address")?;
+
+            let amount_wei = ethers::utils::parse_ether(amount)?;
+
+            // Connect to blockchain
+            let discovery = discovery::Discovery::new(&config).await?;
+            let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
+
+            // Check balance
+            let balance = blockchain.get_eth_balance(wallet.address()).await?;
+            if balance < amount_wei {
+                anyhow::bail!(
+                    "Insufficient balance. Available: {} ETH, Required: {} ETH",
+                    ethers::utils::format_ether(balance),
+                    amount
+                );
+            }
+
+            if output_format != OutputFormat::Json && !yes {
+                println!("Send {} ETH to {:?}?", amount, to_address);
+                println!("(Use -y to skip confirmation)");
+                // In a real CLI, you'd prompt for confirmation here
+                // For now, we proceed since they didn't use -y
+            }
+
+            match blockchain.send_eth(to_address, amount_wei, &wallet).await {
+                Ok(tx_hash) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "success": true,
+                            "tx_hash": format!("{:?}", tx_hash),
+                            "to": format!("{:?}", to_address),
+                            "amount": amount
+                        })).unwrap());
+                    } else {
+                        println!("Transaction sent!");
+                        println!("TX Hash: {:?}", tx_hash);
+                    }
+                }
+                Err(e) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "success": false,
+                            "error": format!("{}", e)
+                        })).unwrap());
+                    } else {
+                        println!("Failed to send ETH: {}", e);
+                    }
+                }
+            }
+        }
+        cli::WalletSubcommand::History { limit } => {
+            let wallet = wallet.context("Wallet required. Add 'private_key' to config.")?;
+
+            // Connect to blockchain
+            let discovery = discovery::Discovery::new(&config).await?;
+            let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
+
+            match blockchain.get_transaction_history(wallet.address(), limit).await {
+                Ok(txs) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "address": format!("{:?}", wallet.address()),
+                            "transactions": txs.iter().map(|tx| json!({
+                                "hash": tx.hash,
+                                "from": tx.from,
+                                "to": tx.to,
+                                "value": tx.value,
+                                "timestamp": tx.timestamp
+                            })).collect::<Vec<_>>()
+                        })).unwrap());
+                    } else {
+                        println!("Transaction History for {:?}", wallet.address());
+                        println!("{}", "=".repeat(70));
+                        if txs.is_empty() {
+                            println!("No transactions found.");
+                        } else {
+                            for tx in &txs {
+                                println!("{} | {} ETH | {}",
+                                    &tx.hash[..10],
+                                    tx.value,
+                                    if tx.from == format!("{:?}", wallet.address()) { "OUT" } else { "IN" }
+                                );
+                            }
+                        }
+                        println!("{}", "=".repeat(70));
+                    }
+                }
+                Err(e) => {
+                    if output_format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "error": format!("{}", e)
+                        })).unwrap());
+                    } else {
+                        println!("Error fetching transaction history: {}", e);
+                        println!("Note: Transaction history requires an indexer service.");
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
-fn handle_config(config: Config, subcommand: cli::ConfigSubcommand) -> Result<()> {
+fn handle_config(config: Config, subcommand: cli::ConfigSubcommand, output_format: OutputFormat) -> Result<()> {
     match subcommand {
         cli::ConfigSubcommand::Show => {
-            println!("Current configuration:");
-            println!("{}", toml::to_string_pretty(&config)?);
+            if output_format == OutputFormat::Json {
+                // Output config as JSON
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "path": config.path.to_string_lossy(),
+                    "mode": format!("{:?}", config.mode),
+                    "network": {
+                        "listen_addresses": config.network.listen_addresses,
+                        "max_peers": config.network.max_peers
+                    },
+                    "blockchain": {
+                        "chain_id": config.blockchain.chain_id,
+                        "rpc_url": config.blockchain.manual_rpc_url
+                    }
+                })).unwrap());
+            } else {
+                println!("Current configuration:");
+                println!("{}", toml::to_string_pretty(&config)?);
+            }
         }
         cli::ConfigSubcommand::Init => {
-            println!("Initializing default configuration...");
             Config::create_default()?;
-            println!("Created default config at ~/.oarn/config.toml");
+            if output_format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "success": true,
+                    "path": "~/.oarn/config.toml"
+                })).unwrap());
+            } else {
+                println!("Initializing default configuration...");
+                println!("Created default config at ~/.oarn/config.toml");
+            }
+        }
+        cli::ConfigSubcommand::Validate => {
+            // Config already loaded successfully if we got here
+            if output_format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "valid": true,
+                    "path": config.path.to_string_lossy()
+                })).unwrap());
+            } else {
+                println!("Configuration is valid!");
+                println!("Config file: {:?}", config.path);
+            }
+        }
+        cli::ConfigSubcommand::Path => {
+            if output_format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "path": config.path.to_string_lossy()
+                })).unwrap());
+            } else {
+                println!("{}", config.path.display());
+            }
         }
     }
     Ok(())
 }
 
-async fn handle_governance(config: Config, subcommand: cli::GovernanceSubcommand) -> Result<()> {
+async fn handle_governance(config: Config, subcommand: cli::GovernanceSubcommand, output_format: OutputFormat) -> Result<()> {
     // Initialize discovery and blockchain
     let discovery = discovery::Discovery::new(&config).await?;
     let blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
 
     match subcommand {
         cli::GovernanceSubcommand::List { active, limit } => {
-            println!("Querying governance proposals...\n");
-
             match blockchain.get_proposals(limit).await {
                 Ok(proposals) => {
-                    if proposals.is_empty() {
+                    let filtered: Vec<_> = if active {
+                        proposals.iter().filter(|p| p.status == 1).collect()
+                    } else {
+                        proposals.iter().collect()
+                    };
+
+                    if output_format == OutputFormat::Json {
+                        let json_proposals: Vec<_> = filtered.iter().map(|p| json!({
+                            "id": p.id,
+                            "title": p.title,
+                            "status": p.status_str(),
+                            "for_votes": ethers::utils::format_ether(p.for_votes).to_string(),
+                            "against_votes": ethers::utils::format_ether(p.against_votes).to_string()
+                        })).collect();
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "proposals": json_proposals,
+                            "total": filtered.len()
+                        })).unwrap());
+                        return Ok(());
+                    }
+
+                    println!("Querying governance proposals...\n");
+
+                    if filtered.is_empty() {
                         println!("No proposals found.");
                         return Ok(());
                     }

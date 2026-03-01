@@ -193,6 +193,15 @@ impl IpfsStorage {
         cache_path.exists()
     }
 
+    /// Check if IPFS is available and responding
+    pub async fn is_available(&self) -> bool {
+        // Try to get IPFS node ID to check connectivity
+        match self.client.id(None::<&str>).await {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
     /// Get cache size in bytes
     pub async fn cache_size(&self) -> Result<u64> {
         let mut size = 0u64;

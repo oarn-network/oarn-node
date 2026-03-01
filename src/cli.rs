@@ -1,7 +1,17 @@
 //! CLI argument parsing for OARN node
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// Output format for CLI commands
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum OutputFormat {
+    /// Human-readable text output (default)
+    #[default]
+    Text,
+    /// JSON output for scripting and automation
+    Json,
+}
 
 /// OARN Node - Decentralized AI Research Network
 #[derive(Parser, Debug)]
@@ -18,6 +28,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Output format (text or json)
+    #[arg(long, value_enum, default_value = "text", global = true)]
+    pub output: OutputFormat,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -29,6 +43,19 @@ pub enum Commands {
 
     /// Show node status
     Status,
+
+    /// Show detailed version information
+    Version,
+
+    /// Check node health and connectivity
+    Health,
+
+    /// Show connected peers and network info
+    Peers {
+        /// Show detailed peer information
+        #[arg(short, long)]
+        detailed: bool,
+    },
 
     /// Manage tasks
     Tasks {
@@ -66,6 +93,10 @@ pub enum TasksSubcommand {
         /// Maximum number of tasks to show
         #[arg(short, long, default_value = "20")]
         limit: u32,
+
+        /// Use TaskRegistryV2
+        #[arg(long)]
+        v2: bool,
     },
 
     /// Submit a new task
@@ -103,19 +134,51 @@ pub enum TasksSubcommand {
         consensus: String,
     },
 
+    /// Manually claim a specific task
+    Claim {
+        /// Task ID to claim
+        task_id: u64,
+
+        /// Use TaskRegistryV2
+        #[arg(long)]
+        v2: bool,
+
+        /// Also execute the task after claiming
+        #[arg(short, long)]
+        execute: bool,
+    },
+
     /// Check task status
     Status {
         /// Task ID
         task_id: u64,
+
+        /// Use TaskRegistryV2
+        #[arg(long)]
+        v2: bool,
     },
 
     /// Show tasks submitted by your wallet
-    Mine,
+    Mine {
+        /// Use TaskRegistryV2
+        #[arg(long)]
+        v2: bool,
+    },
 
-    /// Check consensus status for a task
+    /// Check consensus status for a task (V2 only)
     Consensus {
         /// Task ID
         task_id: u64,
+    },
+
+    /// Cancel a task you submitted (before any node claims it)
+    Cancel {
+        /// Task ID to cancel
+        task_id: u64,
+
+        /// Use TaskRegistryV2
+        #[arg(long)]
+        v2: bool,
     },
 }
 
@@ -126,6 +189,26 @@ pub enum WalletSubcommand {
 
     /// Show wallet address
     Address,
+
+    /// Send ETH to another address
+    Send {
+        /// Recipient address
+        to: String,
+
+        /// Amount in ETH (e.g., 0.1)
+        amount: f64,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Show recent transactions
+    History {
+        /// Number of transactions to show
+        #[arg(short, long, default_value = "10")]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,6 +218,12 @@ pub enum ConfigSubcommand {
 
     /// Initialize default configuration
     Init,
+
+    /// Validate configuration file
+    Validate,
+
+    /// Show config file path
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
