@@ -416,17 +416,10 @@ impl P2PNetwork {
         self.swarm
             .connected_peers()
             .map(|peer_id| {
-                let addresses: Vec<Multiaddr> = self.swarm
-                    .behaviour()
-                    .kademlia
-                    .addresses_of_peer(peer_id)
-                    .into_iter()
-                    .collect();
-
                 PeerInfo {
                     id: *peer_id,
-                    addresses,
-                    connected_since: 0, // Would need additional tracking
+                    addresses: Vec::new(), // Address tracking requires connection event handling
+                    connected_since: 0,    // Would need additional tracking
                 }
             })
             .collect()

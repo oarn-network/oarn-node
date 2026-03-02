@@ -542,9 +542,8 @@ fn show_version(output_format: OutputFormat) {
         "name": "oarn-node",
         "version": env!("CARGO_PKG_VERSION"),
         "authors": env!("CARGO_PKG_AUTHORS"),
-        "rust_version": env!("CARGO_PKG_RUST_VERSION"),
-        "target": env!("TARGET"),
-        "build_timestamp": env!("BUILD_TIMESTAMP"),
+        "arch": std::env::consts::ARCH,
+        "os": std::env::consts::OS,
     });
 
     if output_format == OutputFormat::Json {
@@ -553,9 +552,6 @@ fn show_version(output_format: OutputFormat) {
         println!("OARN Node v{}", env!("CARGO_PKG_VERSION"));
         println!("{}", "=".repeat(40));
         println!("Authors:       {}", env!("CARGO_PKG_AUTHORS"));
-        if let Ok(rust_ver) = std::env::var("CARGO_PKG_RUST_VERSION") {
-            println!("Rust Version:  {}", rust_ver);
-        }
         println!("Target:        {}", std::env::consts::ARCH);
         println!("OS:            {}", std::env::consts::OS);
     }
@@ -640,9 +636,9 @@ async fn show_peers(config: Config, detailed: bool, output_format: OutputFormat)
                     "peer_id": p.id.to_string(),
                     "addresses": p.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                     "connected_since": p.connected_since,
-                })).collect()
+                })).collect::<Vec<_>>()
             } else {
-                peers.iter().map(|p| json!(p.id.to_string())).collect()
+                peers.iter().map(|p| json!(p.id.to_string())).collect::<Vec<_>>()
             }
         });
         println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
@@ -700,64 +696,71 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand, output_f
 
     match subcommand {
         cli::TasksSubcommand::List { all, limit, v2 } => {
-            let tasks = if v2 {
-                blockchain.get_available_tasks_v2().await?
-            } else {
-                blockchain.get_available_tasks().await?
-            };
-
-            if output_format == OutputFormat::Json {
-                let json_tasks: Vec<_> = tasks.iter().take(if all { tasks.len() } else { limit as usize }).map(|t| {
-                    json!({
-                        "id": t.id,
-                        "reward_per_node": ethers::utils::format_ether(t.reward_per_node).to_string(),
-                        "required_nodes": t.required_nodes,
-                        "deadline": t.deadline,
-                        "status": "available"
-                    })
-                }).collect();
-                println!("{}", serde_json::to_string_pretty(&json!({
-                    "tasks": json_tasks,
-                    "total": tasks.len(),
-                    "version": if v2 { "v2" } else { "v1" }
-                })).unwrap());
-                return Ok(());
-            }
-
-            println!("Querying tasks from blockchain...\n");
-
-            if tasks.is_empty() {
-                println!("No available tasks found.");
-                return Ok(());
-            }
-
-            println!("{}", "=".repeat(80));
-            println!("{:<6} {:<12} {:<15} {:<12} {:<10}", "ID", "Reward", "Nodes", "Deadline", "Status");
-            println!("{}", "-".repeat(80));
-
-            let mut shown = 0u32;
-            for task in &tasks {
-                if shown >= limit && !all {
-                    break;
+            // Helper to format and display tasks (works for both V1 and V2)
+            let display_tasks = |tasks: Vec<(u64, ethers::types::U256, u32, u64)>, version: &str| {
+                if output_format == OutputFormat::Json {
+                    let json_tasks: Vec<_> = tasks.iter().take(if all { tasks.len() } else { limit as usize }).map(|t| {
+                        json!({
+                            "id": t.0,
+                            "reward_per_node": ethers::utils::format_ether(t.1).to_string(),
+                            "required_nodes": t.2,
+                            "deadline": t.3,
+                            "status": "available"
+                        })
+                    }).collect();
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "tasks": json_tasks,
+                        "total": tasks.len(),
+                        "version": version
+                    })).unwrap());
+                    return;
                 }
 
-                let deadline_str = format_deadline(task.deadline);
-                println!(
-                    "{:<6} {:<12} {:<15} {:<12} {:<10}",
-                    task.id,
-                    format!("{:.4} ETH", ethers::utils::format_ether(task.reward_per_node)),
-                    format!("{} required", task.required_nodes),
-                    deadline_str,
-                    "Available"
-                );
-                shown += 1;
-            }
+                println!("Querying tasks from blockchain...\n");
 
-            println!("{}", "=".repeat(80));
-            println!("Total: {} available tasks", tasks.len());
+                if tasks.is_empty() {
+                    println!("No available tasks found.");
+                    return;
+                }
 
-            if tasks.len() as u32 > limit && !all {
-                println!("(Use --all to show all tasks)");
+                println!("{}", "=".repeat(80));
+                println!("{:<6} {:<12} {:<15} {:<12} {:<10}", "ID", "Reward", "Nodes", "Deadline", "Status");
+                println!("{}", "-".repeat(80));
+
+                let mut shown = 0u32;
+                for task in &tasks {
+                    if shown >= limit && !all {
+                        break;
+                    }
+
+                    let deadline_str = format_deadline(task.3);
+                    println!(
+                        "{:<6} {:<12} {:<15} {:<12} {:<10}",
+                        task.0,
+                        format!("{:.4} ETH", ethers::utils::format_ether(task.1)),
+                        format!("{} required", task.2),
+                        deadline_str,
+                        "Available"
+                    );
+                    shown += 1;
+                }
+
+                println!("{}", "=".repeat(80));
+                println!("Total: {} available tasks", tasks.len());
+
+                if tasks.len() as u32 > limit && !all {
+                    println!("(Use --all to show all tasks)");
+                }
+            };
+
+            if v2 {
+                let tasks = blockchain.get_available_tasks_v2().await?;
+                let normalized: Vec<_> = tasks.iter().map(|t| (t.id, t.reward_per_node, t.required_nodes, t.deadline)).collect();
+                display_tasks(normalized, "v2");
+            } else {
+                let tasks = blockchain.get_available_tasks().await?;
+                let normalized: Vec<_> = tasks.iter().map(|t| (t.id, t.reward_per_node, t.required_nodes, t.deadline)).collect();
+                display_tasks(normalized, "v1");
             }
         }
 
@@ -1027,8 +1030,18 @@ async fn handle_tasks(config: Config, subcommand: cli::TasksSubcommand, output_f
                                 process_claimed_task_v2(&task, &blockchain, &storage, &compute, &wallet).await;
                             }
                         } else {
-                            if let Ok(task) = blockchain.get_task_details(task_id).await {
-                                process_claimed_task(&task, &blockchain, &storage, &compute, &wallet).await;
+                            // Convert TaskDetails to TaskInfo for processing
+                            if let Ok(details) = blockchain.get_task_details(task_id).await {
+                                let task_info = blockchain::TaskInfo {
+                                    id: details.id,
+                                    requester: details.requester,
+                                    model_hash: details.model_hash,
+                                    input_hash: details.input_hash,
+                                    reward_per_node: details.reward_per_node,
+                                    required_nodes: details.required_nodes,
+                                    deadline: details.deadline,
+                                };
+                                process_claimed_task(&task_info, &blockchain, &storage, &compute, &wallet).await;
                             }
                         }
                     }
