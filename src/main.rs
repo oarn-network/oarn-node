@@ -6,6 +6,7 @@
 //! - Claiming and executing AI inference tasks
 //! - Submitting results and earning COMP tokens
 
+mod batch;
 mod cli;
 mod config;
 mod network;
@@ -345,7 +346,17 @@ async fn process_claimed_task_v2(
         }
     };
 
-    // Execute
+    // Check if input is a batch manifest
+    if let Some(batch_manifest) = batch::BatchInputManifest::try_from_bytes(&input) {
+        info!(
+            "Detected batch task with {} inputs - processing in parallel...",
+            batch_manifest.total_count
+        );
+        process_batch_task_v2(task, batch_manifest, &model, blockchain, storage, compute, wallet).await;
+        return;
+    }
+
+    // Regular (non-batch) execution
     info!("Executing V2 task #{}...", task.id);
     match compute.execute(&model, &input).await {
         Ok(result) => {
@@ -370,6 +381,82 @@ async fn process_claimed_task_v2(
         }
         Err(e) => {
             error!("V2 Task #{} execution failed: {}", task.id, e);
+        }
+    }
+}
+
+/// Process a batch task with multiple inputs in parallel
+async fn process_batch_task_v2(
+    task: &blockchain::TaskInfoV2,
+    manifest: batch::BatchInputManifest,
+    model_data: &[u8],
+    blockchain: &blockchain::BlockchainClient,
+    storage: &storage::IpfsStorage,
+    compute: &compute::ComputeEngine,
+    wallet: &LocalWallet,
+) {
+    info!(
+        "Starting batch execution for task #{}: {} inputs",
+        task.id, manifest.total_count
+    );
+
+    let node_address = format!("{:?}", wallet.address());
+
+    // Execute batch in parallel
+    match compute
+        .execute_batch(task.id, &manifest, model_data, &node_address, None)
+        .await
+    {
+        Ok(result_manifest) => {
+            info!(
+                "Batch task #{} completed! {} results in {} ms",
+                task.id,
+                result_manifest.results.len(),
+                result_manifest.execution_metadata.total_time_ms
+            );
+            info!(
+                "Aggregated hash: {}",
+                result_manifest.aggregated_hash
+            );
+
+            // Upload result manifest to IPFS
+            match result_manifest.to_bytes() {
+                Ok(result_bytes) => {
+                    if let Ok(result_cid) = storage.put(&result_bytes).await {
+                        info!("Batch result manifest uploaded to IPFS: {}", result_cid);
+                    }
+
+                    // Convert aggregated hash to bytes32 for on-chain submission
+                    let hash_str = result_manifest.aggregated_hash.strip_prefix("0x")
+                        .unwrap_or(&result_manifest.aggregated_hash);
+                    let mut result_hash = [0u8; 32];
+                    if let Ok(bytes) = hex::decode(hash_str) {
+                        if bytes.len() == 32 {
+                            result_hash.copy_from_slice(&bytes);
+                        }
+                    }
+
+                    // Submit aggregated result hash to V2 contract
+                    match blockchain.submit_result_v2(task.id, result_hash, wallet).await {
+                        Ok(tx_hash) => {
+                            info!("Batch result submitted for task #{}! TX: {:?}", task.id, tx_hash);
+                            info!(
+                                "Consensus will be calculated when {} nodes submit matching aggregated hashes",
+                                task.required_nodes
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to submit batch result for task #{}: {}", task.id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize batch result manifest: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            error!("Batch task #{} execution failed: {}", task.id, e);
         }
     }
 }

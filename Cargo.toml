@@ -75,6 +75,10 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-feature
 futures = "0.3"
 async-trait = "0.1"
 
+# Parallel processing
+rayon = "1.10"
+num_cpus = "1.16"
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
