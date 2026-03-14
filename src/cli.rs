@@ -80,6 +80,17 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: GovernanceSubcommand,
     },
+
+    /// Run local inference test (for testing models before submission)
+    Inference {
+        /// Path to ONNX model file
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Path to input JSON file
+        #[arg(short, long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]

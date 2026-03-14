@@ -72,6 +72,9 @@ async fn main() -> Result<()> {
         Commands::Governance { subcommand } => {
             handle_governance(config, subcommand, output_format).await?;
         }
+        Commands::Inference { model, input } => {
+            run_inference_test(config, model, input, output_format).await?;
+        }
     }
 
     Ok(())
@@ -642,6 +645,82 @@ fn show_version(output_format: OutputFormat) {
         println!("Target:        {}", std::env::consts::ARCH);
         println!("OS:            {}", std::env::consts::OS);
     }
+}
+
+/// Run local inference test
+async fn run_inference_test(
+    config: Config,
+    model_path: std::path::PathBuf,
+    input_path: std::path::PathBuf,
+    output_format: OutputFormat,
+) -> Result<()> {
+    use std::time::Instant;
+
+    println!("OARN Node - Local Inference Test");
+    println!("{}", "=".repeat(50));
+
+    // Expand paths
+    let model_path = shellexpand::tilde(&model_path.to_string_lossy()).to_string();
+    let input_path = shellexpand::tilde(&input_path.to_string_lossy()).to_string();
+
+    println!("Model: {}", model_path);
+    println!("Input: {}", input_path);
+    println!();
+
+    // Read model file
+    let model_data = tokio::fs::read(&model_path).await
+        .context(format!("Failed to read model file: {}", model_path))?;
+    println!("Model size: {} bytes", model_data.len());
+
+    // Read input file
+    let input_data = tokio::fs::read(&input_path).await
+        .context(format!("Failed to read input file: {}", input_path))?;
+    println!("Input size: {} bytes", input_data.len());
+
+    // Show input data (if small enough)
+    if input_data.len() < 500 {
+        if let Ok(input_str) = std::str::from_utf8(&input_data) {
+            println!("Input data: {}", input_str.trim());
+        }
+    }
+    println!();
+
+    // Create compute engine
+    let compute = compute::ComputeEngine::new(&config)?;
+
+    // Run inference
+    println!("Running inference...");
+    let start = Instant::now();
+
+    let result = compute.execute(&model_data, &input_data).await?;
+
+    let elapsed = start.elapsed();
+    println!();
+    println!("Inference completed in {:.2?}", elapsed);
+    println!("Output size: {} bytes", result.len());
+
+    // Hash the result (as would be submitted on-chain)
+    let result_hash = compute.hash_result(&result);
+    println!("Result hash: 0x{}", hex::encode(result_hash));
+    println!();
+
+    // Show output
+    if let Ok(output_str) = std::str::from_utf8(&result) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(output_str) {
+            if output_format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            } else {
+                println!("Output (JSON):");
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            }
+        } else {
+            println!("Output (text): {}", output_str);
+        }
+    } else {
+        println!("Output (hex): 0x{}", hex::encode(&result));
+    }
+
+    Ok(())
 }
 
 /// Check node health and connectivity

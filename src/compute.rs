@@ -244,20 +244,53 @@ impl ComputeEngine {
         let input_name = inputs[0].name().to_string();
         info!("Model input name: {}", input_name);
 
-        // Parse input as f32 values
-        let values = self.parse_f32_input(input_bytes);
+        // Parse input as f32 values with optional shape
+        let (values, provided_shape) = self.parse_f32_input(input_bytes);
         info!("Parsed {} input values", values.len());
 
-        // Use simple 1D shape for now - models should specify their shape
-        let shape: Vec<i64> = vec![1, values.len() as i64];
+        // Determine shape: use provided shape or default to [1, N]
+        let shape: Vec<i64> = if let Some(s) = provided_shape {
+            info!("Using provided shape: {:?}", s);
+            s
+        } else {
+            // Default: batch of 1, then all values
+            let shape = vec![1, values.len() as i64];
+            info!("Using default shape: {:?}", shape);
+            shape
+        };
+
+        // Validate shape matches value count
+        let expected_count: i64 = shape.iter().product();
+        if expected_count != values.len() as i64 && expected_count > 0 {
+            warn!(
+                "Shape {:?} expects {} values but got {}. Adjusting...",
+                shape, expected_count, values.len()
+            );
+            // Pad or truncate values to match expected count
+            let mut adjusted_values = values.clone();
+            adjusted_values.resize(expected_count as usize, 0.0);
+            let input_tensor = ort::value::Tensor::from_array((shape.clone(), adjusted_values))?;
+            return self.run_inference_with_tensor(session, &input_name, input_tensor);
+        }
 
         // Create input tensor using tuple (shape, Vec<data>)
         let input_tensor = ort::value::Tensor::from_array((shape, values))?;
+        self.run_inference_with_tensor(session, &input_name, input_tensor)
+    }
 
+    /// Helper to run inference with a prepared tensor
+    fn run_inference_with_tensor(
+        &self,
+        session: &mut Session,
+        input_name: &str,
+        input_tensor: ort::value::Tensor<f32>,
+    ) -> Result<Vec<u8>> {
         // Get output name before running (to avoid borrow conflicts)
         let output_name = session.outputs().first()
             .map(|o| o.name().to_string())
             .unwrap_or_else(|| "output".to_string());
+
+        info!("Running inference, output name: {}", output_name);
 
         // Run inference
         let outputs = session.run(ort::inputs![input_name => input_tensor])?;
@@ -270,51 +303,116 @@ impl ComputeEngine {
         self.extract_tensor_bytes(output)
     }
 
-    /// Parse input bytes as f32 values
-    fn parse_f32_input(&self, input_bytes: &[u8]) -> Vec<f32> {
+    /// Parse input bytes as f32 values and optional shape
+    fn parse_f32_input(&self, input_bytes: &[u8]) -> (Vec<f32>, Option<Vec<i64>>) {
         // Try JSON first
         if let Ok(json_str) = std::str::from_utf8(input_bytes) {
+            // Try as simple Vec<f32>
             if let Ok(values) = serde_json::from_str::<Vec<f32>>(json_str) {
-                return values;
+                return (values, None);
+            }
+
+            // Try as object with "input" field (and optional "shape")
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(input_arr) = obj.get("input").or_else(|| obj.get("data")).or_else(|| obj.get("values")) {
+                    if let Ok(values) = serde_json::from_value::<Vec<f32>>(input_arr.clone()) {
+                        // Try to get shape
+                        let shape = obj.get("shape")
+                            .and_then(|s| serde_json::from_value::<Vec<i64>>(s.clone()).ok());
+                        return (values, shape);
+                    }
+                }
+
+                // Try to extract params for batch input (temperature, pH, etc.)
+                if let Some(params) = obj.get("params") {
+                    if let Ok(param_obj) = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(params.clone()) {
+                        let values: Vec<f32> = param_obj.values()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect();
+                        if !values.is_empty() {
+                            return (values, None);
+                        }
+                    }
+                }
+
+                // Try to extract numeric values from any JSON object
+                if let Some(map) = obj.as_object() {
+                    let values: Vec<f32> = map.values()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect();
+                    if !values.is_empty() {
+                        return (values, None);
+                    }
+                }
             }
         }
 
-        // Try raw f32 bytes
+        // Try raw f32 bytes (little-endian)
         if input_bytes.len() >= 4 && input_bytes.len() % 4 == 0 {
-            return input_bytes
+            let values: Vec<f32> = input_bytes
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
+            return (values, None);
         }
 
         // Fallback: return single zero
         warn!("Could not parse input, using zero");
-        vec![0.0f32]
+        (vec![0.0f32], None)
     }
 
-    /// Extract tensor output as bytes
+    /// Extract tensor output as JSON bytes for human-readable results
     fn extract_tensor_bytes(&self, output: &ort::value::Value) -> Result<Vec<u8>> {
-        // Try f32 tensor
+        // Try f32 tensor - most common for inference outputs
         if let Ok(tensor) = output.try_extract_tensor::<f32>() {
-            let (_, data) = tensor;
-            let bytes: Vec<u8> = data.iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
-            info!("Extracted f32 tensor: {} bytes", bytes.len());
+            let (shape, data) = tensor;
+            let values: Vec<f32> = data.iter().copied().collect();
+            let shape_vec: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            info!("Extracted f32 tensor: shape={:?}, {} values", shape_vec, values.len());
+
+            // Return as JSON for readability
+            let json_output = serde_json::json!({
+                "type": "f32",
+                "shape": shape_vec,
+                "values": values,
+            });
+            let bytes = serde_json::to_vec(&json_output)?;
             return Ok(bytes);
         }
 
         // Try i64 tensor
         if let Ok(tensor) = output.try_extract_tensor::<i64>() {
-            let (_, data) = tensor;
-            let bytes: Vec<u8> = data.iter()
-                .flat_map(|i| i.to_le_bytes())
-                .collect();
-            info!("Extracted i64 tensor: {} bytes", bytes.len());
+            let (shape, data) = tensor;
+            let values: Vec<i64> = data.iter().copied().collect();
+            let shape_vec: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            info!("Extracted i64 tensor: shape={:?}, {} values", shape_vec, values.len());
+
+            let json_output = serde_json::json!({
+                "type": "i64",
+                "shape": shape_vec,
+                "values": values,
+            });
+            let bytes = serde_json::to_vec(&json_output)?;
             return Ok(bytes);
         }
 
-        warn!("Could not extract tensor, using placeholder");
+        // Try f64 tensor
+        if let Ok(tensor) = output.try_extract_tensor::<f64>() {
+            let (shape, data) = tensor;
+            let values: Vec<f64> = data.iter().copied().collect();
+            let shape_vec: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            info!("Extracted f64 tensor: shape={:?}, {} values", shape_vec, values.len());
+
+            let json_output = serde_json::json!({
+                "type": "f64",
+                "shape": shape_vec,
+                "values": values,
+            });
+            let bytes = serde_json::to_vec(&json_output)?;
+            return Ok(bytes);
+        }
+
+        warn!("Could not extract tensor as known type, using raw bytes");
         Ok(vec![0u8; 32])
     }
 
@@ -363,28 +461,37 @@ impl ComputeEngine {
         info!("Model size: {} bytes", model_data.len());
         info!("Input size: {} bytes", input_data.len());
 
-        // Check if this looks like a real ONNX model (starts with ONNX magic bytes)
-        let is_onnx = model_data.len() > 8 && &model_data[0..4] == b"\x08\x00"
-            || (model_data.len() > 4 && model_data[0] == 0x08); // Protobuf ONNX header
+        // Skip very small "models" (likely JSON metadata, not real models)
+        if model_data.len() < 100 {
+            info!("Model too small ({} bytes), using placeholder mode", model_data.len());
+            return self.execute_placeholder(model_data, input_data);
+        }
 
-        if is_onnx && model_data.len() > 100 {
-            // Try to run real ONNX inference
-            match self.execute_onnx_memory(model_data, input_data).await {
-                Ok(result) => {
-                    info!("ONNX inference completed successfully");
-                    return Ok(result);
-                }
-                Err(e) => {
+        // Try to run as ONNX model first (most common format)
+        match self.execute_onnx_memory(model_data, input_data).await {
+            Ok(result) => {
+                info!("ONNX inference completed successfully, output: {} bytes", result.len());
+                return Ok(result);
+            }
+            Err(e) => {
+                debug!("ONNX inference failed: {}", e);
+                // Check if it's a known non-ONNX format before warning
+                if model_data.starts_with(b"{") || model_data.starts_with(b"[") {
+                    info!("Model appears to be JSON metadata, using placeholder mode");
+                } else {
                     warn!("ONNX inference failed: {}. Falling back to placeholder mode.", e);
                 }
             }
         }
 
-        // Fallback: Placeholder mode - hash model + input to produce a deterministic result
+        // Fallback: Placeholder mode
+        self.execute_placeholder(model_data, input_data)
+    }
+
+    /// Placeholder execution - deterministic hash of model + input
+    fn execute_placeholder(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
         if model_data.is_empty() || input_data.is_empty() {
-            warn!("Empty model or input data - using placeholder mode");
-        } else {
-            info!("Using placeholder execution mode (model not recognized as ONNX)");
+            warn!("Empty model or input data in placeholder mode");
         }
 
         let mut hasher = Keccak256::new();
@@ -521,21 +628,28 @@ impl ComputeEngine {
 
     /// Synchronous execution for use in Rayon parallel context
     fn execute_sync(&self, model_data: &[u8], input_data: &[u8]) -> Vec<u8> {
-        // Check if this looks like a real ONNX model
-        let is_onnx = model_data.len() > 8 && &model_data[0..4] == b"\x08\x00"
-            || (model_data.len() > 4 && model_data[0] == 0x08);
+        // Skip very small "models" (likely JSON metadata)
+        if model_data.len() < 100 {
+            return self.execute_placeholder_sync(model_data, input_data);
+        }
 
-        if is_onnx && model_data.len() > 100 {
-            // Try to run real ONNX inference
-            match self.execute_onnx_sync(model_data, input_data) {
-                Ok(result) => return result,
-                Err(e) => {
-                    debug!("ONNX inference failed: {}", e);
-                }
+        // Try to run as ONNX model first
+        match self.execute_onnx_sync(model_data, input_data) {
+            Ok(result) => {
+                debug!("ONNX inference succeeded, output: {} bytes", result.len());
+                return result;
+            }
+            Err(e) => {
+                debug!("ONNX inference failed: {}", e);
             }
         }
 
         // Fallback: deterministic hash-based placeholder
+        self.execute_placeholder_sync(model_data, input_data)
+    }
+
+    /// Synchronous placeholder execution
+    fn execute_placeholder_sync(&self, model_data: &[u8], input_data: &[u8]) -> Vec<u8> {
         let mut hasher = Keccak256::new();
         hasher.update(model_data);
         hasher.update(input_data);
