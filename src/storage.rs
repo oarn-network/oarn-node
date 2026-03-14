@@ -4,14 +4,19 @@
 //! Supports both local IPFS daemon and public gateways as fallback.
 
 use anyhow::{Context, Result};
+use cid::Cid;
 use hex;
 use ipfs_api_backend_hyper::{IpfsApi, IpfsClient, TryFromUri};
+use multihash::Multihash;
 use reqwest::Client as HttpClient;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+
+// SHA-256 multihash code
+const SHA2_256: u64 = 0x12;
 
 /// Public IPFS gateways for fallback
 const PUBLIC_GATEWAYS: &[&str] = &[
@@ -141,14 +146,13 @@ impl IpfsStorage {
         anyhow::bail!("Failed to fetch CID {} from all gateways", cid)
     }
 
-    /// Get file from IPFS by bytes32 hash (hex encoded)
+    /// Get file from IPFS by bytes32 hash (the SHA-256 digest)
     pub async fn get(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
-        let hex_hash = format!("0x{}", hex::encode(hash));
-        info!("Fetching from IPFS: {}", hex_hash);
+        // Convert bytes32 hash back to CID
+        let cid_str = bytes32_to_cid(hash)?;
+        info!("Fetching from IPFS: {} (from hash 0x{})", cid_str, hex::encode(hash));
 
-        // For IPFS, the hash would typically be a CID
-        // For testnet, we'll use the hex hash as a placeholder CID
-        self.get_by_cid(&hex_hash).await
+        self.get_by_cid(&cid_str).await
     }
 
     /// Add file to IPFS
@@ -232,6 +236,41 @@ impl IpfsStorage {
 
         Ok(())
     }
+}
+
+/// Convert a bytes32 SHA-256 digest back to an IPFS CID
+///
+/// This reconstructs a CIDv1 with raw codec (0x55) from the SHA-256 digest.
+/// The SDK uses cidToBytes32 to extract the digest, and this reverses that process.
+pub fn bytes32_to_cid(hash: &[u8; 32]) -> Result<String> {
+    // Create a SHA-256 multihash from the digest
+    // Multihash format: [code, length, ...digest]
+    let multihash = Multihash::<64>::wrap(SHA2_256, hash)
+        .map_err(|e| anyhow::anyhow!("Failed to create multihash: {}", e))?;
+
+    // Create CIDv1 with raw codec (0x55)
+    let cid = Cid::new_v1(0x55, multihash);
+
+    Ok(cid.to_string())
+}
+
+/// Convert a CID string to bytes32 (the SHA-256 digest)
+///
+/// This extracts the raw SHA-256 digest from a CID.
+#[allow(dead_code)]
+pub fn cid_to_bytes32(cid_str: &str) -> Result<[u8; 32]> {
+    let cid = Cid::try_from(cid_str)
+        .map_err(|e| anyhow::anyhow!("Invalid CID: {}", e))?;
+
+    let digest = cid.hash().digest();
+
+    if digest.len() != 32 {
+        anyhow::bail!("Expected 32-byte digest, got {} bytes", digest.len());
+    }
+
+    let mut result = [0u8; 32];
+    result.copy_from_slice(digest);
+    Ok(result)
 }
 
 #[cfg(test)]
