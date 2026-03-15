@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: oarn-node
+
+jobs:
+  build:
+    name: Build — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            archive: tar.gz
+
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: '!matrix.cross'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} staging/
+          cp config.example.toml staging/
+          cp README.md staging/
+          ARCHIVE=${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          tar -czf $ARCHIVE -C staging .
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" staging/
+          Copy-Item "config.example.toml" staging/
+          Copy-Item "README.md" staging/
+          $Archive = "${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path staging/* -DestinationPath $Archive
+          echo "ARCHIVE=$Archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: oarn-node ${{ github.ref_name }}
+          body: |
+            ## OARN Node ${{ github.ref_name }}
+
+            Decentralized AI compute node for the OARN Network.
+            Run AI inference tasks, earn COMP rewards on Arbitrum Sepolia testnet.
+
+            ---
+
+            ### Quick Install
+
+            **Linux (64-bit)**
+            ```bash
+            tar -xzf oarn-node-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            chmod +x oarn-node
+            ./oarn-node config init
+            ./oarn-node start
+            ```
+
+            **macOS (Apple Silicon)**
+            ```bash
+            tar -xzf oarn-node-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            chmod +x oarn-node
+            ./oarn-node config init
+            ./oarn-node start
+            ```
+
+            **macOS (Intel)**
+            ```bash
+            tar -xzf oarn-node-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz
+            chmod +x oarn-node
+            ./oarn-node config init
+            ./oarn-node start
+            ```
+
+            **Windows**
+            ```
+            Extract oarn-node-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+            oarn-node.exe config init
+            oarn-node.exe start
+            ```
+
+            ---
+
+            ### What you need
+            - Testnet ETH on Arbitrum Sepolia → [Faucet](https://faucet.triangleplatform.com/arbitrum/sepolia)
+            - Edit `config.toml` with your wallet private key and RPC URL
+
+            ### Downloads
+
+            | File | Platform |
+            |------|----------|
+            | `*-x86_64-unknown-linux-gnu.tar.gz` | Linux 64-bit |
+            | `*-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 (Raspberry Pi, cloud) |
+            | `*-x86_64-apple-darwin.tar.gz` | macOS Intel |
+            | `*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon (M1/M2/M3) |
+            | `*-x86_64-pc-windows-msvc.zip` | Windows 64-bit |
+
+            ---
+
+            **Dashboard:** https://oarn-dashboard-lxpk26rfe-flogb96s-projects.vercel.app/
+            **Docs:** https://github.com/oarn-network/oarn-docs
+            **Discord:** https://discord.gg/RsrQwNvt
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

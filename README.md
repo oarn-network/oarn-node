@@ -22,6 +22,26 @@ Rust implementation of the OARN network node software for participating in decen
 
 ## Installation
 
+### Pre-built Binaries (Recommended)
+
+Download the latest release for your platform from the [Releases page](https://github.com/oarn-network/oarn-node/releases).
+
+| Platform | File |
+|----------|------|
+| Linux 64-bit | `oarn-node-*-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `oarn-node-*-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `oarn-node-*-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `oarn-node-*-x86_64-apple-darwin.tar.gz` |
+| Windows 64-bit | `oarn-node-*-x86_64-pc-windows-msvc.zip` |
+
+```bash
+# Linux / macOS
+tar -xzf oarn-node-*.tar.gz
+chmod +x oarn-node
+./oarn-node config init
+./oarn-node start
+```
+
 ### From Source
 
 ```bash
