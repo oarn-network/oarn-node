@@ -21,11 +21,6 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
 
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-            archive: tar.gz
-
           - target: x86_64-apple-darwin
             os: macos-12
             archive: tar.gz
@@ -61,16 +56,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libudev-dev libdbus-1-dev
 
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Build (native)
-        if: '!matrix.cross'
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
