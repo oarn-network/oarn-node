@@ -24,10 +24,6 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
 
-          - target: x86_64-apple-darwin
-            os: macos-13
-            archive: tar.gz
-
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -137,14 +133,6 @@ jobs:
             ./oarn-node start
             ```
 
-            **macOS (Intel)**
-            ```bash
-            tar -xzf oarn-node-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz
-            chmod +x oarn-node
-            ./oarn-node config init
-            ./oarn-node start
-            ```
-
             **Windows**
             ```
             Extract oarn-node-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
@@ -163,8 +151,6 @@ jobs:
             | File | Platform |
             |------|----------|
             | `*-x86_64-unknown-linux-gnu.tar.gz` | Linux 64-bit |
-            | `*-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 (Raspberry Pi, cloud) |
-            | `*-x86_64-apple-darwin.tar.gz` | macOS Intel |
             | `*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon (M1/M2/M3) |
             | `*-x86_64-pc-windows-msvc.zip` | Windows 64-bit |
 
