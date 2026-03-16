@@ -181,7 +181,7 @@ jobs:
 
             ---
 
-            **Dashboard:** https://oarn-dashboard-lxpk26rfe-flogb96s-projects.vercel.app/
+            **Dashboard:** https://oarn-dashboard.vercel.app/
             **Docs:** https://github.com/oarn-network/oarn-docs
             **Discord:** https://discord.gg/RsrQwNvt
           files: artifacts/*
