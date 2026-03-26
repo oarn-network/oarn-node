@@ -12,8 +12,8 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::batch::{
-    BatchConfig, BatchInput, BatchInputManifest, BatchResult, BatchResultManifest,
-    ExecutionMetadata, hash_result_output,
+    hash_result_output, BatchConfig, BatchInput, BatchInputManifest, BatchResult,
+    BatchResultManifest, ExecutionMetadata,
 };
 
 use crate::blockchain::TaskInfo;
@@ -53,20 +53,24 @@ impl ModelRequirements {
     pub fn from_json(json: &str) -> Result<Self> {
         let value: serde_json::Value = serde_json::from_str(json)?;
 
-        let framework = value.get("framework")
+        let framework = value
+            .get("framework")
             .and_then(|v| v.as_str())
             .map(Framework::from)
             .unwrap_or(Framework::Unknown("unspecified".to_string()));
 
-        let min_vram_mb = value.get("min_vram")
+        let min_vram_mb = value
+            .get("min_vram")
             .and_then(|v| v.as_str())
             .and_then(|s| parse_memory_string(s));
 
-        let min_ram_mb = value.get("min_ram")
+        let min_ram_mb = value
+            .get("min_ram")
             .and_then(|v| v.as_str())
             .and_then(|s| parse_memory_string(s));
 
-        let gpu_required = value.get("gpu_required")
+        let gpu_required = value
+            .get("gpu_required")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -83,7 +87,10 @@ impl ModelRequirements {
 fn parse_memory_string(s: &str) -> Option<u64> {
     let s = s.to_uppercase();
     if s.ends_with("GB") {
-        s.trim_end_matches("GB").parse::<u64>().ok().map(|v| v * 1024)
+        s.trim_end_matches("GB")
+            .parse::<u64>()
+            .ok()
+            .map(|v| v * 1024)
     } else if s.ends_with("MB") {
         s.trim_end_matches("MB").parse::<u64>().ok()
     } else {
@@ -103,7 +110,9 @@ pub struct ComputeEngine {
 impl ComputeEngine {
     /// Create a new compute engine
     pub fn new(config: &Config) -> Result<Self> {
-        let supported_frameworks: Vec<Framework> = config.compute.frameworks
+        let supported_frameworks: Vec<Framework> = config
+            .compute
+            .frameworks
             .iter()
             .map(|s| Framework::from(s.as_str()))
             .collect();
@@ -146,7 +155,10 @@ impl ComputeEngine {
         // Check VRAM
         if let (Some(required), Some(available)) = (requirements.min_vram_mb, self.max_vram_mb) {
             if required > available {
-                debug!("Insufficient VRAM: required {} MB, available {} MB", required, available);
+                debug!(
+                    "Insufficient VRAM: required {} MB, available {} MB",
+                    required, available
+                );
                 return false;
             }
         }
@@ -154,7 +166,10 @@ impl ComputeEngine {
         // Check RAM
         if let (Some(required), Some(available)) = (requirements.min_ram_mb, self.max_ram_mb) {
             if required > available {
-                debug!("Insufficient RAM: required {} MB, available {} MB", required, available);
+                debug!(
+                    "Insufficient RAM: required {} MB, available {} MB",
+                    required, available
+                );
                 return false;
             }
         }
@@ -180,7 +195,9 @@ impl ComputeEngine {
         }
 
         self.active_tasks += 1;
-        let result = self.execute_inner(model_path, input_path, requirements).await;
+        let result = self
+            .execute_inner(model_path, input_path, requirements)
+            .await;
         self.active_tasks -= 1;
 
         result
@@ -197,15 +214,9 @@ impl ComputeEngine {
         info!("Input: {:?}", input_path);
 
         match requirements.framework {
-            Framework::ONNX => {
-                self.execute_onnx_file(model_path, input_path).await
-            }
-            Framework::PyTorch => {
-                self.execute_pytorch_file(model_path, input_path).await
-            }
-            Framework::TensorFlow => {
-                self.execute_tensorflow_file(model_path, input_path).await
-            }
+            Framework::ONNX => self.execute_onnx_file(model_path, input_path).await,
+            Framework::PyTorch => self.execute_pytorch_file(model_path, input_path).await,
+            Framework::TensorFlow => self.execute_tensorflow_file(model_path, input_path).await,
             Framework::Unknown(ref name) => {
                 warn!("Unknown framework: {}", name);
                 Err(anyhow::anyhow!("Unknown framework: {}", name))
@@ -213,7 +224,11 @@ impl ComputeEngine {
         }
     }
 
-    async fn execute_onnx_file(&self, model_path: &PathBuf, input_path: &PathBuf) -> Result<Vec<u8>> {
+    async fn execute_onnx_file(
+        &self,
+        model_path: &PathBuf,
+        input_path: &PathBuf,
+    ) -> Result<Vec<u8>> {
         info!("Loading ONNX model from {:?}", model_path);
 
         // Load the ONNX model
@@ -223,7 +238,8 @@ impl ComputeEngine {
             .context("Failed to load ONNX model")?;
 
         // Load input data
-        let input_bytes = tokio::fs::read(input_path).await
+        let input_bytes = tokio::fs::read(input_path)
+            .await
             .context("Failed to read input file")?;
 
         // Run inference
@@ -264,7 +280,9 @@ impl ComputeEngine {
         if expected_count != values.len() as i64 && expected_count > 0 {
             warn!(
                 "Shape {:?} expects {} values but got {}. Adjusting...",
-                shape, expected_count, values.len()
+                shape,
+                expected_count,
+                values.len()
             );
             // Pad or truncate values to match expected count
             let mut adjusted_values = values.clone();
@@ -286,7 +304,9 @@ impl ComputeEngine {
         input_tensor: ort::value::Tensor<f32>,
     ) -> Result<Vec<u8>> {
         // Get output name before running (to avoid borrow conflicts)
-        let output_name = session.outputs().first()
+        let output_name = session
+            .outputs()
+            .first()
             .map(|o| o.name().to_string())
             .unwrap_or_else(|| "output".to_string());
 
@@ -296,8 +316,7 @@ impl ComputeEngine {
         let outputs = session.run(ort::inputs![input_name => input_tensor])?;
 
         // Get output by name
-        let output = outputs.get(&output_name)
-            .context("No output from model")?;
+        let output = outputs.get(&output_name).context("No output from model")?;
 
         // Extract output as bytes
         self.extract_tensor_bytes(output)
@@ -314,10 +333,15 @@ impl ComputeEngine {
 
             // Try as object with "input" field (and optional "shape")
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(input_arr) = obj.get("input").or_else(|| obj.get("data")).or_else(|| obj.get("values")) {
+                if let Some(input_arr) = obj
+                    .get("input")
+                    .or_else(|| obj.get("data"))
+                    .or_else(|| obj.get("values"))
+                {
                     if let Ok(values) = serde_json::from_value::<Vec<f32>>(input_arr.clone()) {
                         // Try to get shape
-                        let shape = obj.get("shape")
+                        let shape = obj
+                            .get("shape")
                             .and_then(|s| serde_json::from_value::<Vec<i64>>(s.clone()).ok());
                         return (values, shape);
                     }
@@ -325,8 +349,12 @@ impl ComputeEngine {
 
                 // Try to extract params for batch input (temperature, pH, etc.)
                 if let Some(params) = obj.get("params") {
-                    if let Ok(param_obj) = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(params.clone()) {
-                        let values: Vec<f32> = param_obj.values()
+                    if let Ok(param_obj) = serde_json::from_value::<
+                        serde_json::Map<String, serde_json::Value>,
+                    >(params.clone())
+                    {
+                        let values: Vec<f32> = param_obj
+                            .values()
                             .filter_map(|v| v.as_f64().map(|f| f as f32))
                             .collect();
                         if !values.is_empty() {
@@ -337,7 +365,8 @@ impl ComputeEngine {
 
                 // Try to extract numeric values from any JSON object
                 if let Some(map) = obj.as_object() {
-                    let values: Vec<f32> = map.values()
+                    let values: Vec<f32> = map
+                        .values()
                         .filter_map(|v| v.as_f64().map(|f| f as f32))
                         .collect();
                     if !values.is_empty() {
@@ -368,7 +397,11 @@ impl ComputeEngine {
             let (shape, data) = tensor;
             let values: Vec<f32> = data.iter().copied().collect();
             let shape_vec: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
-            info!("Extracted f32 tensor: shape={:?}, {} values", shape_vec, values.len());
+            info!(
+                "Extracted f32 tensor: shape={:?}, {} values",
+                shape_vec,
+                values.len()
+            );
 
             // Return as JSON for readability
             let json_output = serde_json::json!({
@@ -385,7 +418,11 @@ impl ComputeEngine {
             let (shape, data) = tensor;
             let values: Vec<i64> = data.iter().copied().collect();
             let shape_vec: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
-            info!("Extracted i64 tensor: shape={:?}, {} values", shape_vec, values.len());
+            info!(
+                "Extracted i64 tensor: shape={:?}, {} values",
+                shape_vec,
+                values.len()
+            );
 
             let json_output = serde_json::json!({
                 "type": "i64",
@@ -401,7 +438,11 @@ impl ComputeEngine {
             let (shape, data) = tensor;
             let values: Vec<f64> = data.iter().copied().collect();
             let shape_vec: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
-            info!("Extracted f64 tensor: shape={:?}, {} values", shape_vec, values.len());
+            info!(
+                "Extracted f64 tensor: shape={:?}, {} values",
+                shape_vec,
+                values.len()
+            );
 
             let json_output = serde_json::json!({
                 "type": "f64",
@@ -416,13 +457,21 @@ impl ComputeEngine {
         Ok(vec![0u8; 32])
     }
 
-    async fn execute_pytorch_file(&self, _model_path: &PathBuf, _input_path: &PathBuf) -> Result<Vec<u8>> {
+    async fn execute_pytorch_file(
+        &self,
+        _model_path: &PathBuf,
+        _input_path: &PathBuf,
+    ) -> Result<Vec<u8>> {
         // TODO: Implement PyTorch execution via tch-rs
         info!("PyTorch execution not yet implemented");
         Ok(vec![0u8; 32])
     }
 
-    async fn execute_tensorflow_file(&self, _model_path: &PathBuf, _input_path: &PathBuf) -> Result<Vec<u8>> {
+    async fn execute_tensorflow_file(
+        &self,
+        _model_path: &PathBuf,
+        _input_path: &PathBuf,
+    ) -> Result<Vec<u8>> {
         // TODO: Implement TensorFlow execution
         info!("TensorFlow execution not yet implemented");
         Ok(vec![0u8; 32])
@@ -463,14 +512,20 @@ impl ComputeEngine {
 
         // Skip very small "models" (likely JSON metadata, not real models)
         if model_data.len() < 100 {
-            info!("Model too small ({} bytes), using placeholder mode", model_data.len());
+            info!(
+                "Model too small ({} bytes), using placeholder mode",
+                model_data.len()
+            );
             return self.execute_placeholder(model_data, input_data);
         }
 
         // Try to run as ONNX model first (most common format)
         match self.execute_onnx_memory(model_data, input_data).await {
             Ok(result) => {
-                info!("ONNX inference completed successfully, output: {} bytes", result.len());
+                info!(
+                    "ONNX inference completed successfully, output: {} bytes",
+                    result.len()
+                );
                 return Ok(result);
             }
             Err(e) => {
@@ -479,7 +534,10 @@ impl ComputeEngine {
                 if model_data.starts_with(b"{") || model_data.starts_with(b"[") {
                     info!("Model appears to be JSON metadata, using placeholder mode");
                 } else {
-                    warn!("ONNX inference failed: {}. Falling back to placeholder mode.", e);
+                    warn!(
+                        "ONNX inference failed: {}. Falling back to placeholder mode.",
+                        e
+                    );
                 }
             }
         }
@@ -505,7 +563,10 @@ impl ComputeEngine {
 
     /// Execute ONNX model directly from memory
     async fn execute_onnx_memory(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
-        info!("Loading ONNX model from memory ({} bytes)", model_data.len());
+        info!(
+            "Loading ONNX model from memory ({} bytes)",
+            model_data.len()
+        );
 
         // Load the ONNX model from memory
         let mut session = Session::builder()?
@@ -747,7 +808,8 @@ mod tests {
 
     #[test]
     fn test_model_requirements_from_json() {
-        let json = r#"{"framework": "onnx", "min_vram": "4GB", "min_ram": "8GB", "gpu_required": true}"#;
+        let json =
+            r#"{"framework": "onnx", "min_vram": "4GB", "min_ram": "8GB", "gpu_required": true}"#;
         let requirements = ModelRequirements::from_json(json).unwrap();
 
         assert_eq!(requirements.framework, Framework::ONNX);

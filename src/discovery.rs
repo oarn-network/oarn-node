@@ -44,7 +44,7 @@ pub struct RpcProvider {
 pub struct CoreContracts {
     pub oarn_registry: String,
     pub task_registry: String,
-    pub task_registry_v2: String,  // Multi-node consensus version
+    pub task_registry_v2: String, // Multi-node consensus version
     pub token_reward: String,
     pub validator_registry: String,
     pub governance: String,
@@ -93,7 +93,10 @@ impl Discovery {
             "ens" => self.discover_via_ens().await?,
             "dht" => self.discover_via_dht().await?,
             "manual" => self.use_manual_config()?,
-            _ => anyhow::bail!("Unknown discovery method: {}", self.config.network.discovery.method),
+            _ => anyhow::bail!(
+                "Unknown discovery method: {}",
+                self.config.network.discovery.method
+            ),
         }
 
         info!(
@@ -156,7 +159,10 @@ impl Discovery {
         // 3. Try to resolve bootstrap nodes from ENS TXT records
         // Format: oarn-bootstrap.eth -> TXT records with multiaddrs
         let bootstrap_ens = ens_registry.replace("registry", "bootstrap");
-        if let Ok(bootstrap_info) = self.resolve_ens_text(&provider, &bootstrap_ens, "nodes").await {
+        if let Ok(bootstrap_info) = self
+            .resolve_ens_text(&provider, &bootstrap_ens, "nodes")
+            .await
+        {
             for node_info in bootstrap_info.split(';') {
                 if let Some((peer_id, multiaddr)) = self.parse_bootstrap_record(node_info) {
                     info!("Discovered bootstrap node from ENS: {}", peer_id);
@@ -172,7 +178,8 @@ impl Discovery {
 
         // 4. Try to resolve contract addresses from ENS
         // task-registry.oarn.eth, token-reward.oarn.eth, etc.
-        self.resolve_contract_addresses(&provider, &ens_registry).await;
+        self.resolve_contract_addresses(&provider, &ens_registry)
+            .await;
 
         // Check if we discovered anything useful
         if self.rpc_providers.is_empty() && self.bootstrap_nodes.is_empty() {
@@ -232,8 +239,13 @@ impl Discovery {
             Ok(_) => {
                 // Name exists, but we can't get TXT records directly with ethers-rs
                 // This would require calling the ENS resolver contract's text() function
-                debug!("ENS name {} exists but TXT record lookup not implemented", name);
-                Err(anyhow::anyhow!("TXT record lookup requires direct contract call"))
+                debug!(
+                    "ENS name {} exists but TXT record lookup not implemented",
+                    name
+                );
+                Err(anyhow::anyhow!(
+                    "TXT record lookup requires direct contract call"
+                ))
             }
             Err(e) => {
                 debug!("ENS name {} not found: {}", name, e);
@@ -412,7 +424,8 @@ impl Discovery {
     pub async fn get_random_rpc(&self) -> Result<RpcProvider> {
         use rand::seq::SliceRandom;
 
-        let healthy: Vec<_> = self.rpc_providers
+        let healthy: Vec<_> = self
+            .rpc_providers
             .iter()
             .filter(|p| p.uptime > 9000) // >90% uptime
             .cloned()
@@ -569,7 +582,10 @@ mod tests {
 
         // Should have the RPC provider
         assert_eq!(discovery.rpc_providers.len(), 1);
-        assert_eq!(discovery.rpc_providers[0].endpoint, "https://test-rpc.example.com");
+        assert_eq!(
+            discovery.rpc_providers[0].endpoint,
+            "https://test-rpc.example.com"
+        );
     }
 
     #[tokio::test]
@@ -609,14 +625,12 @@ mod tests {
         let discovery = Discovery {
             config: config.clone(),
             bootstrap_nodes: vec![],
-            rpc_providers: vec![
-                RpcProvider {
-                    endpoint: "https://rpc1.example.com".to_string(),
-                    onion_endpoint: None,
-                    stake: 1000,
-                    uptime: 9500,
-                },
-            ],
+            rpc_providers: vec![RpcProvider {
+                endpoint: "https://rpc1.example.com".to_string(),
+                onion_endpoint: None,
+                stake: 1000,
+                uptime: 9500,
+            }],
             core_contracts: None,
         };
 
@@ -658,14 +672,12 @@ mod tests {
         let discovery = Discovery {
             config: config.clone(),
             bootstrap_nodes: vec![],
-            rpc_providers: vec![
-                RpcProvider {
-                    endpoint: "https://unhealthy.example.com".to_string(),
-                    onion_endpoint: None,
-                    stake: 1000,
-                    uptime: 5000, // All unhealthy
-                },
-            ],
+            rpc_providers: vec![RpcProvider {
+                endpoint: "https://unhealthy.example.com".to_string(),
+                onion_endpoint: None,
+                stake: 1000,
+                uptime: 5000, // All unhealthy
+            }],
             core_contracts: None,
         };
 
@@ -708,6 +720,9 @@ mod tests {
         };
 
         assert!(discovery.get_core_contracts().is_some());
-        assert_eq!(discovery.get_core_contracts().unwrap().oarn_registry, "0x1234");
+        assert_eq!(
+            discovery.get_core_contracts().unwrap().oarn_registry,
+            "0x1234"
+        );
     }
 }

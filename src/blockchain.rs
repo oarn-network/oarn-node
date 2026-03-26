@@ -6,13 +6,13 @@
 use anyhow::{Context, Result};
 use ethers::{
     prelude::*,
-    providers::{Http, Provider, Middleware},
-    types::{Address, U256, TxHash},
+    providers::{Http, Middleware, Provider},
     signers::LocalWallet,
+    types::{Address, TxHash, U256},
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::discovery::Discovery;
@@ -120,7 +120,7 @@ pub struct BlockchainClient {
 
     // Contract addresses (discovered, not hardcoded)
     task_registry_address: Option<Address>,
-    task_registry_v2_address: Option<Address>,  // Multi-node consensus version
+    task_registry_v2_address: Option<Address>, // Multi-node consensus version
     token_reward_address: Option<Address>,
     oarn_registry_address: Option<Address>,
     governance_address: Option<Address>,
@@ -128,7 +128,7 @@ pub struct BlockchainClient {
 
     // Contract instances
     task_registry: Option<TaskRegistryContract<Provider<Http>>>,
-    task_registry_v2: Option<TaskRegistryV2Contract<Provider<Http>>>,  // Multi-node consensus
+    task_registry_v2: Option<TaskRegistryV2Contract<Provider<Http>>>, // Multi-node consensus
     governance: Option<GovernanceContract<Provider<Http>>>,
     gov_token: Option<GOVToken<Provider<Http>>>,
 }
@@ -142,8 +142,8 @@ impl BlockchainClient {
         let rpc = discovery.get_random_rpc().await?;
         info!("Connecting to RPC: {}", rpc.endpoint);
 
-        let provider = Provider::<Http>::try_from(&rpc.endpoint)
-            .context("Failed to create provider")?;
+        let provider =
+            Provider::<Http>::try_from(&rpc.endpoint).context("Failed to create provider")?;
 
         // Verify chain ID matches config
         let chain_id = provider.get_chainid().await?.as_u64();
@@ -157,47 +157,57 @@ impl BlockchainClient {
         info!("Connected to chain ID: {}", chain_id);
 
         // Get contract addresses from discovery
-        let (task_registry_address, task_registry_v2_address, token_reward_address, oarn_registry_address, governance_address, gov_token_address) =
-            if let Some(contracts) = discovery.get_core_contracts() {
-                (
-                    contracts.task_registry.parse().ok(),
-                    contracts.task_registry_v2.parse().ok(),
-                    contracts.token_reward.parse().ok(),
-                    contracts.oarn_registry.parse().ok(),
-                    contracts.governance.parse().ok(),
-                    contracts.gov_token.parse().ok(),
-                )
-            } else {
-                (None, None, None, None, None, None)
-            };
+        let (
+            task_registry_address,
+            task_registry_v2_address,
+            token_reward_address,
+            oarn_registry_address,
+            governance_address,
+            gov_token_address,
+        ) = if let Some(contracts) = discovery.get_core_contracts() {
+            (
+                contracts.task_registry.parse().ok(),
+                contracts.task_registry_v2.parse().ok(),
+                contracts.token_reward.parse().ok(),
+                contracts.oarn_registry.parse().ok(),
+                contracts.governance.parse().ok(),
+                contracts.gov_token.parse().ok(),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
 
         let provider = Arc::new(provider);
 
         // Initialize contract instances if addresses are available
-        let task_registry = task_registry_address.map(|addr| {
-            TaskRegistryContract::new(addr, provider.clone())
-        });
+        let task_registry =
+            task_registry_address.map(|addr| TaskRegistryContract::new(addr, provider.clone()));
 
-        let task_registry_v2 = task_registry_v2_address.map(|addr| {
-            TaskRegistryV2Contract::new(addr, provider.clone())
-        });
+        let task_registry_v2 = task_registry_v2_address
+            .map(|addr| TaskRegistryV2Contract::new(addr, provider.clone()));
 
-        let governance = governance_address.map(|addr| {
-            GovernanceContract::new(addr, provider.clone())
-        });
+        let governance =
+            governance_address.map(|addr| GovernanceContract::new(addr, provider.clone()));
 
-        let gov_token = gov_token_address.map(|addr| {
-            GOVToken::new(addr, provider.clone())
-        });
+        let gov_token = gov_token_address.map(|addr| GOVToken::new(addr, provider.clone()));
 
         if task_registry.is_some() {
-            info!("TaskRegistry contract initialized at {:?}", task_registry_address);
+            info!(
+                "TaskRegistry contract initialized at {:?}",
+                task_registry_address
+            );
         }
         if task_registry_v2.is_some() {
-            info!("TaskRegistryV2 contract initialized at {:?}", task_registry_v2_address);
+            info!(
+                "TaskRegistryV2 contract initialized at {:?}",
+                task_registry_v2_address
+            );
         }
         if governance.is_some() {
-            info!("Governance contract initialized at {:?}", governance_address);
+            info!(
+                "Governance contract initialized at {:?}",
+                governance_address
+            );
         }
 
         Ok(Self {
@@ -242,13 +252,18 @@ impl BlockchainClient {
 
     /// Query available tasks from TaskRegistry (V1)
     pub async fn get_available_tasks(&self) -> Result<Vec<TaskInfo>> {
-        let contract = self.task_registry.as_ref()
+        let contract = self
+            .task_registry
+            .as_ref()
             .context("TaskRegistry contract not initialized")?;
 
         info!("Querying available tasks from TaskRegistry...");
 
         // Get total task count first
-        let task_count = contract.task_count().call().await
+        let task_count = contract
+            .task_count()
+            .call()
+            .await
             .context("Failed to call taskCount")?;
 
         info!("Total task count on-chain: {}", task_count);
@@ -273,7 +288,10 @@ impl BlockchainClient {
                     let status = task.9; // status field
                     let deadline = task.8.as_u64(); // deadline field
 
-                    info!("Task #{}: status={}, deadline={}, current_time={}", i, status, deadline, current_time);
+                    info!(
+                        "Task #{}: status={}, deadline={}, current_time={}",
+                        i, status, deadline, current_time
+                    );
 
                     // Only include Pending (0) or Active (1) tasks that haven't expired
                     if (status == 0 || status == 1) && deadline > current_time {
@@ -288,7 +306,12 @@ impl BlockchainClient {
                             deadline,
                         });
                     } else {
-                        info!("Task #{} is NOT available (status={}, expired={})", i, status, deadline <= current_time);
+                        info!(
+                            "Task #{} is NOT available (status={}, expired={})",
+                            i,
+                            status,
+                            deadline <= current_time
+                        );
                     }
                 }
                 Err(e) => {
@@ -303,12 +326,17 @@ impl BlockchainClient {
 
     /// Query available tasks from TaskRegistryV2 (multi-node consensus)
     pub async fn get_available_tasks_v2(&self) -> Result<Vec<TaskInfoV2>> {
-        let contract = self.task_registry_v2.as_ref()
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
         info!("Querying available tasks from TaskRegistryV2...");
 
-        let task_count = contract.task_count().call().await
+        let task_count = contract
+            .task_count()
+            .call()
+            .await
             .context("Failed to call taskCount")?;
 
         info!("Total task count on TaskRegistryV2: {}", task_count);
@@ -367,25 +395,36 @@ impl BlockchainClient {
 
     /// Check if a task has been claimed by this node
     pub async fn has_claimed_task(&self, task_id: u64, node_address: Address) -> Result<bool> {
-        let contract = self.task_registry.as_ref()
+        let contract = self
+            .task_registry
+            .as_ref()
             .context("TaskRegistry contract not initialized")?;
 
-        let claimed = contract.has_claimed_task(U256::from(task_id), node_address).call().await?;
+        let claimed = contract
+            .has_claimed_task(U256::from(task_id), node_address)
+            .call()
+            .await?;
         Ok(claimed)
     }
 
     /// Check if a result has been submitted by this node
     pub async fn has_submitted_result(&self, task_id: u64, node_address: Address) -> Result<bool> {
-        let contract = self.task_registry.as_ref()
+        let contract = self
+            .task_registry
+            .as_ref()
             .context("TaskRegistry contract not initialized")?;
 
-        let submitted = contract.has_submitted_result(U256::from(task_id), node_address).call().await?;
+        let submitted = contract
+            .has_submitted_result(U256::from(task_id), node_address)
+            .call()
+            .await?;
         Ok(submitted)
     }
 
     /// Claim a task (V1 TaskRegistry)
     pub async fn claim_task(&self, task_id: u64, wallet: &LocalWallet) -> Result<TxHash> {
-        let contract_address = self.task_registry_address
+        let contract_address = self
+            .task_registry_address
             .context("TaskRegistry address not discovered")?;
 
         info!("Claiming task #{} on TaskRegistry...", task_id);
@@ -402,16 +441,19 @@ impl BlockchainClient {
 
         info!("Claim transaction sent: {:?}", tx_hash);
 
-        let receipt = pending_tx.await?
-            .context("Transaction failed")?;
+        let receipt = pending_tx.await?.context("Transaction failed")?;
 
-        info!("Task #{} claimed successfully in block {:?}", task_id, receipt.block_number);
+        info!(
+            "Task #{} claimed successfully in block {:?}",
+            task_id, receipt.block_number
+        );
         Ok(tx_hash)
     }
 
     /// Claim a task on TaskRegistryV2 (multi-node consensus)
     pub async fn claim_task_v2(&self, task_id: u64, wallet: &LocalWallet) -> Result<TxHash> {
-        let contract_address = self.task_registry_v2_address
+        let contract_address = self
+            .task_registry_v2_address
             .context("TaskRegistryV2 address not discovered")?;
 
         info!("Claiming task #{} on TaskRegistryV2...", task_id);
@@ -428,10 +470,12 @@ impl BlockchainClient {
 
         info!("Claim V2 transaction sent: {:?}", tx_hash);
 
-        let receipt = pending_tx.await?
-            .context("Transaction failed")?;
+        let receipt = pending_tx.await?.context("Transaction failed")?;
 
-        info!("Task #{} claimed on V2 in block {:?}", task_id, receipt.block_number);
+        info!(
+            "Task #{} claimed on V2 in block {:?}",
+            task_id, receipt.block_number
+        );
         Ok(tx_hash)
     }
 
@@ -442,7 +486,8 @@ impl BlockchainClient {
         result_hash: [u8; 32],
         wallet: &LocalWallet,
     ) -> Result<TxHash> {
-        let contract_address = self.task_registry_address
+        let contract_address = self
+            .task_registry_address
             .context("TaskRegistry address not discovered")?;
 
         info!("Submitting result for task #{} on TaskRegistry...", task_id);
@@ -459,10 +504,12 @@ impl BlockchainClient {
 
         info!("Submit result transaction sent: {:?}", tx_hash);
 
-        let receipt = pending_tx.await?
-            .context("Transaction failed")?;
+        let receipt = pending_tx.await?.context("Transaction failed")?;
 
-        info!("Result submitted for task #{} in block {:?}", task_id, receipt.block_number);
+        info!(
+            "Result submitted for task #{} in block {:?}",
+            task_id, receipt.block_number
+        );
         Ok(tx_hash)
     }
 
@@ -473,10 +520,14 @@ impl BlockchainClient {
         result_hash: [u8; 32],
         wallet: &LocalWallet,
     ) -> Result<TxHash> {
-        let contract_address = self.task_registry_v2_address
+        let contract_address = self
+            .task_registry_v2_address
             .context("TaskRegistryV2 address not discovered")?;
 
-        info!("Submitting result for task #{} on TaskRegistryV2...", task_id);
+        info!(
+            "Submitting result for task #{} on TaskRegistryV2...",
+            task_id
+        );
 
         let client = Arc::new(SignerMiddleware::new(
             self.provider.clone(),
@@ -490,10 +541,12 @@ impl BlockchainClient {
 
         info!("Submit result V2 transaction sent: {:?}", tx_hash);
 
-        let receipt = pending_tx.await?
-            .context("Transaction failed")?;
+        let receipt = pending_tx.await?.context("Transaction failed")?;
 
-        info!("Result submitted on V2 for task #{} in block {:?}", task_id, receipt.block_number);
+        info!(
+            "Result submitted on V2 for task #{} in block {:?}",
+            task_id, receipt.block_number
+        );
 
         // Note: Consensus will be calculated automatically when enough nodes submit
         Ok(tx_hash)
@@ -501,19 +554,33 @@ impl BlockchainClient {
 
     /// Check if a task has been claimed on V2
     pub async fn has_claimed_task_v2(&self, task_id: u64, node_address: Address) -> Result<bool> {
-        let contract = self.task_registry_v2.as_ref()
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
-        let claimed = contract.has_claimed_task(U256::from(task_id), node_address).call().await?;
+        let claimed = contract
+            .has_claimed_task(U256::from(task_id), node_address)
+            .call()
+            .await?;
         Ok(claimed)
     }
 
     /// Check if a result has been submitted on V2
-    pub async fn has_submitted_result_v2(&self, task_id: u64, node_address: Address) -> Result<bool> {
-        let contract = self.task_registry_v2.as_ref()
+    pub async fn has_submitted_result_v2(
+        &self,
+        task_id: u64,
+        node_address: Address,
+    ) -> Result<bool> {
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
-        let submitted = contract.has_submitted_result(U256::from(task_id), node_address).call().await?;
+        let submitted = contract
+            .has_submitted_result(U256::from(task_id), node_address)
+            .call()
+            .await?;
         Ok(submitted)
     }
 
@@ -528,18 +595,25 @@ impl BlockchainClient {
         deadline: u64,
         wallet: &LocalWallet,
     ) -> Result<(TxHash, u64)> {
-        let contract_address = self.task_registry_address
+        let contract_address = self
+            .task_registry_address
             .context("TaskRegistry address not discovered")?;
 
         info!("Submitting new task to TaskRegistry...");
         info!("  Model hash: 0x{}", hex::encode(model_hash));
         info!("  Input hash: 0x{}", hex::encode(input_hash));
-        info!("  Reward per node: {} ETH", ethers::utils::format_ether(reward_per_node));
+        info!(
+            "  Reward per node: {} ETH",
+            ethers::utils::format_ether(reward_per_node)
+        );
         info!("  Required nodes: {}", required_nodes);
 
         // Calculate total cost
         let total_cost = reward_per_node * U256::from(required_nodes);
-        info!("  Total cost: {} ETH", ethers::utils::format_ether(total_cost));
+        info!(
+            "  Total cost: {} ETH",
+            ethers::utils::format_ether(total_cost)
+        );
 
         // Create a signing client
         let client = Arc::new(SignerMiddleware::new(
@@ -562,15 +636,16 @@ impl BlockchainClient {
             .value(total_cost);
 
         // Send and await the transaction
-        let pending_tx = call.send().await
+        let pending_tx = call
+            .send()
+            .await
             .context("Failed to send submitTask transaction")?;
         let tx_hash = pending_tx.tx_hash();
 
         info!("Task submission transaction sent: {:?}", tx_hash);
 
         // Wait for confirmation
-        let receipt = pending_tx.await?
-            .context("Transaction failed")?;
+        let receipt = pending_tx.await?.context("Transaction failed")?;
 
         info!("Task submitted in block {:?}", receipt.block_number);
 
@@ -590,26 +665,36 @@ impl BlockchainClient {
         reward_per_node: U256,
         required_nodes: u64,
         deadline: u64,
-        consensus_type: u8,  // 0=Majority, 1=SuperMajority, 2=Unanimous
+        consensus_type: u8, // 0=Majority, 1=SuperMajority, 2=Unanimous
         wallet: &LocalWallet,
     ) -> Result<(TxHash, u64)> {
-        let contract_address = self.task_registry_v2_address
+        let contract_address = self
+            .task_registry_v2_address
             .context("TaskRegistryV2 address not discovered")?;
 
         info!("Submitting new task to TaskRegistryV2...");
         info!("  Model hash: 0x{}", hex::encode(model_hash));
         info!("  Input hash: 0x{}", hex::encode(input_hash));
-        info!("  Reward per node: {} ETH", ethers::utils::format_ether(reward_per_node));
+        info!(
+            "  Reward per node: {} ETH",
+            ethers::utils::format_ether(reward_per_node)
+        );
         info!("  Required nodes: {}", required_nodes);
-        info!("  Consensus type: {}", match consensus_type {
-            0 => "Majority (>50%)",
-            1 => "SuperMajority (>66%)",
-            2 => "Unanimous (100%)",
-            _ => "Unknown",
-        });
+        info!(
+            "  Consensus type: {}",
+            match consensus_type {
+                0 => "Majority (>50%)",
+                1 => "SuperMajority (>66%)",
+                2 => "Unanimous (100%)",
+                _ => "Unknown",
+            }
+        );
 
         let total_cost = reward_per_node * U256::from(required_nodes);
-        info!("  Total cost: {} ETH", ethers::utils::format_ether(total_cost));
+        info!(
+            "  Total cost: {} ETH",
+            ethers::utils::format_ether(total_cost)
+        );
 
         let client = Arc::new(SignerMiddleware::new(
             self.provider.clone(),
@@ -631,14 +716,15 @@ impl BlockchainClient {
             )
             .value(total_cost);
 
-        let pending_tx = call.send().await
+        let pending_tx = call
+            .send()
+            .await
             .context("Failed to send submitTask V2 transaction")?;
         let tx_hash = pending_tx.tx_hash();
 
         info!("Task V2 submission transaction sent: {:?}", tx_hash);
 
-        let receipt = pending_tx.await?
-            .context("Transaction failed")?;
+        let receipt = pending_tx.await?.context("Transaction failed")?;
 
         info!("Task submitted to V2 in block {:?}", receipt.block_number);
 
@@ -650,11 +736,16 @@ impl BlockchainClient {
 
     /// Get detailed task information
     pub async fn get_task_details(&self, task_id: u64) -> Result<TaskDetails> {
-        let contract = self.task_registry.as_ref()
+        let contract = self
+            .task_registry
+            .as_ref()
             .context("TaskRegistry contract not initialized")?;
 
         // Use the tasks mapping which we know works
-        let task = contract.tasks(U256::from(task_id)).call().await
+        let task = contract
+            .tasks(U256::from(task_id))
+            .call()
+            .await
             .context("Failed to get task details")?;
 
         // Check if task exists (id will be 0 if not found)
@@ -680,7 +771,9 @@ impl BlockchainClient {
 
     /// Get minimum reward per node
     pub async fn get_min_reward(&self) -> Result<U256> {
-        let contract = self.task_registry.as_ref()
+        let contract = self
+            .task_registry
+            .as_ref()
             .context("TaskRegistry contract not initialized")?;
 
         let min_reward = contract.min_reward_per_node().call().await?;
@@ -689,7 +782,9 @@ impl BlockchainClient {
 
     /// Get task count
     pub async fn get_task_count(&self) -> Result<u64> {
-        let contract = self.task_registry.as_ref()
+        let contract = self
+            .task_registry
+            .as_ref()
             .context("TaskRegistry contract not initialized")?;
 
         let count = contract.task_count().call().await?;
@@ -698,7 +793,8 @@ impl BlockchainClient {
 
     /// Get COMP token balance
     pub async fn get_comp_balance(&self, address: Address) -> Result<U256> {
-        let token_address = self.token_reward_address
+        let token_address = self
+            .token_reward_address
             .context("COMP token address not discovered")?;
 
         let token = ERC20Token::new(token_address, self.provider.clone());
@@ -724,7 +820,11 @@ impl BlockchainClient {
         let task_count = self.get_task_count().await.unwrap_or(0);
 
         for task_id in 1..=task_count {
-            if self.has_submitted_result(task_id, address).await.unwrap_or(false) {
+            if self
+                .has_submitted_result(task_id, address)
+                .await
+                .unwrap_or(false)
+            {
                 tasks_completed += 1;
             }
         }
@@ -768,7 +868,9 @@ impl BlockchainClient {
 
     /// Get proposal count
     pub async fn get_proposal_count(&self) -> Result<u64> {
-        let contract = self.governance.as_ref()
+        let contract = self
+            .governance
+            .as_ref()
             .context("Governance contract not initialized")?;
 
         let count = contract.proposal_count().call().await?;
@@ -777,7 +879,9 @@ impl BlockchainClient {
 
     /// Get proposal by index
     pub async fn get_proposal(&self, index: u64) -> Result<Proposal> {
-        let contract = self.governance.as_ref()
+        let contract = self
+            .governance
+            .as_ref()
             .context("Governance contract not initialized")?;
 
         let proposal_id = contract.get_proposal_id(U256::from(index)).call().await?;
@@ -802,7 +906,11 @@ impl BlockchainClient {
         let count = self.get_proposal_count().await?;
         let mut proposals = Vec::new();
 
-        let start = if count > limit as u64 { count - limit as u64 } else { 0 };
+        let start = if count > limit as u64 {
+            count - limit as u64
+        } else {
+            0
+        };
 
         for i in start..count {
             match self.get_proposal(i).await {
@@ -816,7 +924,9 @@ impl BlockchainClient {
 
     /// Get voting power
     pub async fn get_voting_power(&self, address: Address) -> Result<U256> {
-        let contract = self.gov_token.as_ref()
+        let contract = self
+            .gov_token
+            .as_ref()
             .context("GOV token contract not initialized")?;
 
         let votes = contract.get_votes(address).call().await?;
@@ -825,7 +935,9 @@ impl BlockchainClient {
 
     /// Get GOV token balance
     pub async fn get_gov_token_balance(&self, address: Address) -> Result<U256> {
-        let contract = self.gov_token.as_ref()
+        let contract = self
+            .gov_token
+            .as_ref()
             .context("GOV token contract not initialized")?;
 
         let balance = contract.balance_of(address).call().await?;
@@ -834,7 +946,9 @@ impl BlockchainClient {
 
     /// Get current delegate
     pub async fn get_delegate(&self, address: Address) -> Result<Address> {
-        let contract = self.gov_token.as_ref()
+        let contract = self
+            .gov_token
+            .as_ref()
             .context("GOV token contract not initialized")?;
 
         let delegate = contract.delegates(address).call().await?;
@@ -843,7 +957,8 @@ impl BlockchainClient {
 
     /// Delegate voting power
     pub async fn delegate_votes(&self, to: Address, wallet: &LocalWallet) -> Result<TxHash> {
-        let token_address = self.gov_token_address
+        let token_address = self
+            .gov_token_address
             .context("GOV token address not discovered")?;
 
         info!("Delegating voting power to {:?}...", to);
@@ -871,11 +986,11 @@ impl BlockchainClient {
         support: u8, // 0 = Against, 1 = For, 2 = Abstain
         wallet: &LocalWallet,
     ) -> Result<TxHash> {
-        let gov_address = self.governance_address
+        let gov_address = self
+            .governance_address
             .context("Governance address not discovered")?;
 
-        let proposal_id_u256 = U256::from_dec_str(proposal_id)
-            .context("Invalid proposal ID")?;
+        let proposal_id_u256 = U256::from_dec_str(proposal_id).context("Invalid proposal ID")?;
 
         info!("Casting vote on proposal {}...", proposal_id);
 
@@ -897,11 +1012,12 @@ impl BlockchainClient {
 
     /// Check if address has voted on proposal
     pub async fn has_voted(&self, proposal_id: &str, address: Address) -> Result<bool> {
-        let contract = self.governance.as_ref()
+        let contract = self
+            .governance
+            .as_ref()
             .context("Governance contract not initialized")?;
 
-        let proposal_id_u256 = U256::from_dec_str(proposal_id)
-            .context("Invalid proposal ID")?;
+        let proposal_id_u256 = U256::from_dec_str(proposal_id).context("Invalid proposal ID")?;
 
         let voted = contract.has_voted(proposal_id_u256, address).call().await?;
         Ok(voted)
@@ -917,7 +1033,8 @@ impl BlockchainClient {
         value: U256,
         wallet: &LocalWallet,
     ) -> Result<(TxHash, String)> {
-        let gov_address = self.governance_address
+        let gov_address = self
+            .governance_address
             .context("Governance address not discovered")?;
 
         info!("Creating proposal: {}", title);
@@ -954,11 +1071,16 @@ impl BlockchainClient {
 
     /// Get consensus status for a task (requires TaskRegistryV2)
     pub async fn get_consensus_status(&self, task_id: u64) -> Result<ConsensusStatus> {
-        let contract = self.task_registry_v2.as_ref()
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
         // Get task details first
-        let task = contract.tasks(U256::from(task_id)).call().await
+        let task = contract
+            .tasks(U256::from(task_id))
+            .call()
+            .await
             .context("Failed to get task details")?;
 
         // Check if task exists
@@ -967,7 +1089,10 @@ impl BlockchainClient {
         }
 
         // Get consensus status
-        let consensus = contract.get_consensus_status(U256::from(task_id)).call().await
+        let consensus = contract
+            .get_consensus_status(U256::from(task_id))
+            .call()
+            .await
             .context("Failed to get consensus status - contract may not support consensus")?;
 
         Ok(ConsensusStatus {
@@ -977,8 +1102,8 @@ impl BlockchainClient {
             total_submissions: consensus.2.as_u64(),
             unique_results: consensus.4.as_u64(),
             consensus_reached: consensus.3,
-            task_status: task.10,      // status field
-            consensus_type: task.11,   // consensusType field
+            task_status: task.10,    // status field
+            consensus_type: task.11, // consensusType field
         })
     }
 
@@ -994,16 +1119,23 @@ impl BlockchainClient {
 
     /// Check if a node matched consensus for a task
     pub async fn did_node_match_consensus(&self, task_id: u64, node: Address) -> Result<bool> {
-        let contract = self.task_registry_v2.as_ref()
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
-        let matched = contract.did_node_match_consensus(U256::from(task_id), node).call().await?;
+        let matched = contract
+            .did_node_match_consensus(U256::from(task_id), node)
+            .call()
+            .await?;
         Ok(matched)
     }
 
     /// Get task count from V2
     pub async fn get_task_count_v2(&self) -> Result<u64> {
-        let contract = self.task_registry_v2.as_ref()
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
         let count = contract.task_count().call().await?;
@@ -1012,10 +1144,15 @@ impl BlockchainClient {
 
     /// Get detailed task information from V2
     pub async fn get_task_details_v2(&self, task_id: u64) -> Result<TaskInfoV2> {
-        let contract = self.task_registry_v2.as_ref()
+        let contract = self
+            .task_registry_v2
+            .as_ref()
             .context("TaskRegistryV2 contract not initialized")?;
 
-        let task = contract.tasks(U256::from(task_id)).call().await
+        let task = contract
+            .tasks(U256::from(task_id))
+            .call()
+            .await
             .context("Failed to get task details")?;
 
         if task.0.is_zero() {
@@ -1037,19 +1174,28 @@ impl BlockchainClient {
     }
 
     /// Send ETH to an address
-    pub async fn send_eth(&self, to: Address, amount: U256, wallet: &LocalWallet) -> Result<TxHash> {
-        info!("Sending {} ETH to {:?}...", ethers::utils::format_ether(amount), to);
+    pub async fn send_eth(
+        &self,
+        to: Address,
+        amount: U256,
+        wallet: &LocalWallet,
+    ) -> Result<TxHash> {
+        info!(
+            "Sending {} ETH to {:?}...",
+            ethers::utils::format_ether(amount),
+            to
+        );
 
         let client = Arc::new(SignerMiddleware::new(
             self.provider.clone(),
             wallet.clone().with_chain_id(self.chain_id),
         ));
 
-        let tx = TransactionRequest::new()
-            .to(to)
-            .value(amount);
+        let tx = TransactionRequest::new().to(to).value(amount);
 
-        let pending_tx = client.send_transaction(tx, None).await
+        let pending_tx = client
+            .send_transaction(tx, None)
+            .await
             .context("Failed to send ETH transaction")?;
         let tx_hash = pending_tx.tx_hash();
 
@@ -1077,7 +1223,11 @@ impl BlockchainClient {
 
     /// Get transaction history for an address
     /// Note: This requires an indexer service - returns empty for now
-    pub async fn get_transaction_history(&self, address: Address, limit: u32) -> Result<Vec<TransactionInfo>> {
+    pub async fn get_transaction_history(
+        &self,
+        address: Address,
+        limit: u32,
+    ) -> Result<Vec<TransactionInfo>> {
         // Transaction history requires an indexer like Etherscan/Arbiscan API
         // or running our own indexer. For now, return empty.
         let _ = (address, limit);

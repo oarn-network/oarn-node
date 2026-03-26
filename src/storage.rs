@@ -53,7 +53,10 @@ impl IpfsStorage {
                 true
             }
             Err(e) => {
-                warn!("Could not connect to local IPFS: {}. Will use public gateways.", e);
+                warn!(
+                    "Could not connect to local IPFS: {}. Will use public gateways.",
+                    e
+                );
                 false
             }
         };
@@ -84,7 +87,8 @@ impl IpfsStorage {
             info!("Fetching from local IPFS: {}", cid);
             use futures::TryStreamExt;
 
-            match self.client
+            match self
+                .client
                 .cat(cid)
                 .map_ok(|chunk| chunk.to_vec())
                 .try_concat()
@@ -150,7 +154,11 @@ impl IpfsStorage {
     pub async fn get(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
         // Convert bytes32 hash back to CID
         let cid_str = bytes32_to_cid(hash)?;
-        info!("Fetching from IPFS: {} (from hash 0x{})", cid_str, hex::encode(hash));
+        info!(
+            "Fetching from IPFS: {} (from hash 0x{})",
+            cid_str,
+            hex::encode(hash)
+        );
 
         self.get_by_cid(&cid_str).await
     }
@@ -226,8 +234,11 @@ impl IpfsStorage {
         let max_bytes = self.max_cache_mb * 1024 * 1024;
 
         if size > max_bytes {
-            info!("Cache size {} MB exceeds limit {} MB, cleaning...",
-                  size / (1024 * 1024), self.max_cache_mb);
+            info!(
+                "Cache size {} MB exceeds limit {} MB, cleaning...",
+                size / (1024 * 1024),
+                self.max_cache_mb
+            );
 
             // TODO: Implement LRU cache eviction
             // For now, just log a warning
@@ -259,8 +270,7 @@ pub fn bytes32_to_cid(hash: &[u8; 32]) -> Result<String> {
 /// This extracts the raw SHA-256 digest from a CID.
 #[allow(dead_code)]
 pub fn cid_to_bytes32(cid_str: &str) -> Result<[u8; 32]> {
-    let cid = Cid::try_from(cid_str)
-        .map_err(|e| anyhow::anyhow!("Invalid CID: {}", e))?;
+    let cid = Cid::try_from(cid_str).map_err(|e| anyhow::anyhow!("Invalid CID: {}", e))?;
 
     let digest = cid.hash().digest();
 
@@ -325,8 +335,12 @@ mod tests {
         fs::create_dir_all(&cache_dir).await.unwrap();
 
         // Create some test files
-        fs::write(cache_dir.join("file1"), b"test content 1").await.unwrap();
-        fs::write(cache_dir.join("file2"), b"test content 2").await.unwrap();
+        fs::write(cache_dir.join("file1"), b"test content 1")
+            .await
+            .unwrap();
+        fs::write(cache_dir.join("file2"), b"test content 2")
+            .await
+            .unwrap();
 
         let storage = test_storage(cache_dir);
 
@@ -343,7 +357,9 @@ mod tests {
         fs::create_dir_all(&cache_dir).await.unwrap();
 
         // Create a small file (well under 100 MB limit)
-        fs::write(cache_dir.join("small_file"), b"small content").await.unwrap();
+        fs::write(cache_dir.join("small_file"), b"small content")
+            .await
+            .unwrap();
 
         let storage = test_storage(cache_dir);
 

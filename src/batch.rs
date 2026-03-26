@@ -269,13 +269,11 @@ mod tests {
 
     #[test]
     fn test_batch_result_manifest_creation() {
-        let results = vec![
-            BatchResult {
-                input_id: 0,
-                output: serde_json::json!({"yield": 0.5}),
-                hash: "0x123".to_string(),
-            },
-        ];
+        let results = vec![BatchResult {
+            input_id: 0,
+            output: serde_json::json!({"yield": 0.5}),
+            hash: "0x123".to_string(),
+        }];
 
         let metadata = ExecutionMetadata {
             total_time_ms: 1000,

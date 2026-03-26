@@ -107,10 +107,8 @@ impl P2PNetwork {
                 let ping = ping::Behaviour::new(ping::Config::new());
 
                 // Create mDNS for local network discovery
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    local_peer_id,
-                ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
                 Ok(OARNBehaviour {
                     gossipsub,
@@ -138,7 +136,10 @@ impl P2PNetwork {
                 node.multiaddr.parse::<Multiaddr>(),
                 node.peer_id.parse::<PeerId>(),
             ) {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
                 info!("Added bootstrap node: {} at {}", peer_id, addr);
                 bootstrap_count += 1;
 
@@ -214,7 +215,11 @@ impl P2PNetwork {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 self.discovered_peers.insert(peer_id);
-                info!("Connected to peer: {} (total: {})", peer_id, self.discovered_peers.len());
+                info!(
+                    "Connected to peer: {} (total: {})",
+                    peer_id,
+                    self.discovered_peers.len()
+                );
 
                 // Add peer to Kademlia if not already known
                 // The identify protocol will provide addresses
@@ -223,12 +228,17 @@ impl P2PNetwork {
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 self.discovered_peers.remove(&peer_id);
-                info!("Disconnected from peer: {} (remaining: {})", peer_id, self.discovered_peers.len());
+                info!(
+                    "Disconnected from peer: {} (remaining: {})",
+                    peer_id,
+                    self.discovered_peers.len()
+                );
                 Some(NetworkEvent::PeerDisconnected(peer_id))
             }
-            SwarmEvent::Behaviour(OARNBehaviourEvent::Gossipsub(
-                gossipsub::Event::Message { message, .. },
-            )) => {
+            SwarmEvent::Behaviour(OARNBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                message,
+                ..
+            })) => {
                 // Parse task announcement
                 if let Ok(task) = serde_json::from_slice::<TaskAnnouncement>(&message.data) {
                     return Some(NetworkEvent::TaskAnnounced(task));
@@ -258,35 +268,35 @@ impl P2PNetwork {
     /// Handle Kademlia DHT events
     fn handle_kademlia_event(&mut self, event: kad::Event) {
         match event {
-            kad::Event::RoutingUpdated { peer, is_new_peer, .. } => {
+            kad::Event::RoutingUpdated {
+                peer, is_new_peer, ..
+            } => {
                 if is_new_peer {
                     info!("New peer added to DHT: {}", peer);
                 } else {
                     debug!("DHT routing updated: {}", peer);
                 }
             }
-            kad::Event::OutboundQueryProgressed { result, .. } => {
-                match result {
-                    kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { num_remaining, .. })) => {
-                        if num_remaining == 0 {
-                            info!("DHT bootstrap complete!");
-                            self.bootstrap_complete = true;
-                        } else {
-                            debug!("DHT bootstrap progress: {} remaining", num_remaining);
-                        }
+            kad::Event::OutboundQueryProgressed { result, .. } => match result {
+                kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { num_remaining, .. })) => {
+                    if num_remaining == 0 {
+                        info!("DHT bootstrap complete!");
+                        self.bootstrap_complete = true;
+                    } else {
+                        debug!("DHT bootstrap progress: {} remaining", num_remaining);
                     }
-                    kad::QueryResult::Bootstrap(Err(e)) => {
-                        warn!("DHT bootstrap error: {:?}", e);
-                    }
-                    kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                        info!("Found {} closest peers", ok.peers.len());
-                        for peer in ok.peers {
-                            self.discovered_peers.insert(peer);
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                kad::QueryResult::Bootstrap(Err(e)) => {
+                    warn!("DHT bootstrap error: {:?}", e);
+                }
+                kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                    info!("Found {} closest peers", ok.peers.len());
+                    for peer in ok.peers {
+                        self.discovered_peers.insert(peer);
+                    }
+                }
+                _ => {}
+            },
             kad::Event::RoutablePeer { peer, address } => {
                 info!("Discovered routable peer: {} at {}", peer, address);
             }
@@ -303,7 +313,10 @@ impl P2PNetwork {
                         info!("mDNS discovered peer: {} at {}", peer_id, addr);
 
                         // Add to Kademlia
-                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, addr.clone());
 
                         // Try to dial the peer
                         if let Err(e) = self.swarm.dial(addr.clone()) {
@@ -331,16 +344,26 @@ impl P2PNetwork {
     fn handle_identify_event(&mut self, event: identify::Event) {
         match event {
             identify::Event::Received { peer_id, info } => {
-                debug!("Identified peer {}: {} with {} addresses",
-                       peer_id, info.protocol_version, info.listen_addrs.len());
+                debug!(
+                    "Identified peer {}: {} with {} addresses",
+                    peer_id,
+                    info.protocol_version,
+                    info.listen_addrs.len()
+                );
 
                 // Add all addresses to Kademlia
                 for addr in info.listen_addrs {
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr);
                 }
 
                 // Add peer to gossipsub
-                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .add_explicit_peer(&peer_id);
             }
             identify::Event::Sent { peer_id } => {
                 debug!("Sent identify info to {}", peer_id);
@@ -354,10 +377,7 @@ impl P2PNetwork {
         let topic = gossipsub::IdentTopic::new("oarn/tasks/v1");
         let data = serde_json::to_vec(task)?;
 
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic, data)?;
+        self.swarm.behaviour_mut().gossipsub.publish(topic, data)?;
 
         Ok(())
     }
@@ -381,13 +401,19 @@ impl P2PNetwork {
     pub fn find_peers(&mut self) {
         // Query for random peer IDs to discover more nodes
         let random_peer = PeerId::random();
-        self.swarm.behaviour_mut().kademlia.get_closest_peers(random_peer);
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .get_closest_peers(random_peer);
         debug!("Initiated DHT peer discovery");
     }
 
     /// Add a peer address to the DHT
     pub fn add_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&peer_id, addr.clone());
         info!("Added peer to DHT: {} at {}", peer_id, addr);
 
         // Try to dial the peer
