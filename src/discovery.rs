@@ -7,11 +7,81 @@
 //! 3. On-chain registry (OARNRegistry.sol)
 
 use anyhow::{Context, Result};
-use ethers::providers::{Http, Middleware, Provider};
+use ethers::{
+    prelude::abigen,
+    providers::{Http, Middleware, Provider},
+    types::Address,
+};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+
+// OARNRegistry contract bindings for on-chain discovery.
+// JSON ABI format is used here because the human-readable parser does not
+// reliably handle tuple[] (array-of-struct) return types.
+abigen!(
+    OARNRegistryContract,
+    r#"[
+        {
+            "name": "getCoreContractsV2",
+            "type": "function",
+            "inputs": [],
+            "outputs": [
+                {"name": "_taskRegistry",      "type": "address"},
+                {"name": "_taskRegistryV2",    "type": "address"},
+                {"name": "_tokenReward",       "type": "address"},
+                {"name": "_validatorRegistry", "type": "address"},
+                {"name": "_governance",        "type": "address"},
+                {"name": "_govToken",          "type": "address"}
+            ],
+            "stateMutability": "view"
+        },
+        {
+            "name": "getActiveRPCProviders",
+            "type": "function",
+            "inputs": [],
+            "outputs": [{
+                "name": "",
+                "type": "tuple[]",
+                "components": [
+                    {"name": "endpoint",      "type": "string"},
+                    {"name": "onionEndpoint", "type": "string"},
+                    {"name": "owner",         "type": "address"},
+                    {"name": "stake",         "type": "uint256"},
+                    {"name": "registeredAt",  "type": "uint256"},
+                    {"name": "lastHeartbeat", "type": "uint256"},
+                    {"name": "uptime",        "type": "uint256"},
+                    {"name": "reportCount",   "type": "uint256"},
+                    {"name": "isActive",      "type": "bool"}
+                ]
+            }],
+            "stateMutability": "view"
+        },
+        {
+            "name": "getActiveBootstrapNodes",
+            "type": "function",
+            "inputs": [],
+            "outputs": [{
+                "name": "",
+                "type": "tuple[]",
+                "components": [
+                    {"name": "peer_id",       "type": "string"},
+                    {"name": "multiaddr",     "type": "string"},
+                    {"name": "onionAddress",  "type": "string"},
+                    {"name": "i2pAddress",    "type": "string"},
+                    {"name": "owner",         "type": "address"},
+                    {"name": "stake",         "type": "uint256"},
+                    {"name": "registeredAt",  "type": "uint256"},
+                    {"name": "lastHeartbeat", "type": "uint256"},
+                    {"name": "isActive",      "type": "bool"}
+                ]
+            }],
+            "stateMutability": "view"
+        }
+    ]"#
+);
 
 /// Public Ethereum mainnet RPC endpoints for ENS resolution
 const ENS_RPC_ENDPOINTS: &[&str] = &[
@@ -321,46 +391,213 @@ impl Discovery {
     }
 
     /// Discover infrastructure via DHT
+    ///
+    /// NOTE: Full DHT discovery requires a running libp2p swarm (Kademlia).
+    /// The swarm is initialised in network.rs AFTER discovery completes, so
+    /// DHT-based bootstrap cannot be wired here without a circular dependency.
+    /// The correct integration point is network.rs: once the swarm is live,
+    /// query `/oarn/bootstrap` and `/oarn/rpc` keys and call
+    /// `discovery.add_rpc_provider()` / `discovery.add_bootstrap_node()`.
     async fn discover_via_dht(&mut self) -> Result<()> {
-        info!("Discovering via DHT...");
-
-        // In production, this would:
-        // 1. Connect to well-known DHT keys (/oarn/bootstrap, /oarn/rpc)
-        // 2. Retrieve and verify signed records
-        // 3. Validate against on-chain stakes
-
-        // For development, we'll use a minimal bootstrap process
-        // TODO: Implement actual DHT discovery
-
-        warn!("DHT discovery not yet implemented");
-        Err(anyhow::anyhow!("DHT discovery not implemented"))
+        warn!("DHT discovery requires a running swarm — falling through to on-chain");
+        Err(anyhow::anyhow!(
+            "DHT discovery not available at pre-swarm bootstrap stage"
+        ))
     }
 
-    /// Discover infrastructure via on-chain registry
+    /// Discover infrastructure via on-chain OARNRegistry contract.
+    ///
+    /// Uses the configured `manual_rpc_url` (or the public Arbitrum Sepolia RPC
+    /// as a one-time bootstrap) to call OARNRegistry and populate:
+    /// - core contract addresses (`getCoreContractsV2`)
+    /// - active RPC providers (`getActiveRPCProviders`)
+    /// - active bootstrap nodes (`getActiveBootstrapNodes`)
     async fn discover_via_onchain(&mut self) -> Result<()> {
         info!("Discovering via on-chain registry...");
 
-        // This requires an initial RPC connection
-        // In production, we'd use a well-known public RPC as last resort
-        // and immediately verify/switch to discovered RPCs
+        // Determine bootstrap RPC — manual config takes priority
+        let rpc_url = match &self.config.blockchain.manual_rpc_url {
+            Some(url) => {
+                warn!("Using manual RPC URL for bootstrap: {}", url);
+                url.clone()
+            }
+            None => {
+                // The public Arbitrum Sepolia RPC is the only hardcoded value
+                // permitted: used once to reach OARNRegistry, then replaced by
+                // the decentralised provider set discovered from the contract.
+                info!("No manual RPC configured — using public Arbitrum Sepolia RPC for bootstrap");
+                "https://sepolia-rollup.arbitrum.io/rpc".to_string()
+            }
+        };
 
-        // For development, allow manual RPC override
-        if let Some(rpc_url) = &self.config.blockchain.manual_rpc_url {
-            warn!("Using manual RPC URL for bootstrap: {}", rpc_url);
+        let provider =
+            Provider::<Http>::try_from(rpc_url.as_str()).context("Failed to create provider")?;
 
-            // Query OARNRegistry contract
-            // TODO: Implement actual contract calls
+        // Verify connectivity
+        provider
+            .get_block_number()
+            .await
+            .with_context(|| format!("Cannot reach RPC at {}", rpc_url))?;
 
-            // Add the manual RPC as a discovered provider
+        // Always add the bootstrap RPC as a fallback provider entry
+        if let Some(url) = &self.config.blockchain.manual_rpc_url {
             self.rpc_providers.push(RpcProvider {
-                endpoint: rpc_url.clone(),
+                endpoint: url.clone(),
                 onion_endpoint: None,
                 stake: 0,
                 uptime: 10000,
             });
         }
 
-        Ok(())
+        // Resolve OARNRegistry address from prior ENS discovery or config
+        let registry_addr_str = self
+            .core_contracts
+            .as_ref()
+            .map(|c| c.oarn_registry.clone())
+            .or_else(|| {
+                self.config
+                    .blockchain
+                    .contracts
+                    .as_ref()
+                    .and_then(|c| c.oarn_registry.clone())
+            });
+
+        let registry_addr = match registry_addr_str {
+            Some(ref s) if !s.is_empty() => match s.parse::<Address>() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    warn!("Invalid OARNRegistry address '{}': {}", s, e);
+                    return if self.rpc_providers.is_empty() {
+                        Err(anyhow::anyhow!(
+                            "No usable OARNRegistry address or manual RPC"
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                }
+            },
+            _ => {
+                warn!("No OARNRegistry address configured — skipping contract queries");
+                return if self.rpc_providers.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "No OARNRegistry address and no manual RPC configured"
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+        };
+
+        info!("Querying OARNRegistry at {:?}", registry_addr);
+        let registry = OARNRegistryContract::new(registry_addr, Arc::new(provider));
+
+        // ── Core contract addresses ──────────────────────────────────────────
+        // getCoreContractsV2 returns (taskReg, taskRegV2, tokenReward, validatorReg, governance, govToken)
+        match registry.get_core_contracts_v2().call().await {
+            Ok(r) => {
+                info!("Loaded core contracts from OARNRegistry");
+                self.core_contracts = Some(CoreContracts {
+                    oarn_registry: format!("{:?}", registry_addr),
+                    task_registry: format!("{:?}", r.0),
+                    task_registry_v2: format!("{:?}", r.1),
+                    token_reward: format!("{:?}", r.2),
+                    validator_registry: format!("{:?}", r.3),
+                    governance: format!("{:?}", r.4),
+                    gov_token: format!("{:?}", r.5),
+                });
+            }
+            Err(e) => {
+                warn!("Failed to query core contracts: {}", e);
+            }
+        }
+
+        // ── RPC providers ────────────────────────────────────────────────────
+        // getActiveRPCProviders returns Vec<(endpoint, onionEndpoint, owner, stake, registeredAt, lastHeartbeat, uptime, reportCount, isActive)>
+        match registry.get_active_rpc_providers().call().await {
+            Ok(providers) => {
+                info!(
+                    "Discovered {} active RPC provider(s) from OARNRegistry",
+                    providers.len()
+                );
+                for p in providers {
+                    let (
+                        endpoint,
+                        onion_ep,
+                        _owner,
+                        stake,
+                        _reg_at,
+                        _hb,
+                        uptime,
+                        _reports,
+                        _active,
+                    ) = p;
+                    if !endpoint.is_empty() {
+                        self.rpc_providers.push(RpcProvider {
+                            endpoint,
+                            onion_endpoint: if onion_ep.is_empty() {
+                                None
+                            } else {
+                                Some(onion_ep)
+                            },
+                            stake: stake.as_u64(),
+                            uptime: uptime.as_u32(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to query RPC providers: {}", e);
+            }
+        }
+
+        // ── Bootstrap nodes ──────────────────────────────────────────────────
+        // getActiveBootstrapNodes returns Vec<(peerId, multiaddr, onionAddress, i2pAddress, owner, stake, registeredAt, lastHeartbeat, isActive)>
+        match registry.get_active_bootstrap_nodes().call().await {
+            Ok(nodes) => {
+                info!(
+                    "Discovered {} active bootstrap node(s) from OARNRegistry",
+                    nodes.len()
+                );
+                for n in nodes {
+                    let (
+                        peer_id,
+                        multiaddr,
+                        onion_addr,
+                        i2p_addr,
+                        _owner,
+                        _stake,
+                        _reg_at,
+                        _hb,
+                        _active,
+                    ) = n;
+                    if !peer_id.is_empty() {
+                        self.bootstrap_nodes.push(BootstrapNode {
+                            peer_id,
+                            multiaddr,
+                            onion_address: if onion_addr.is_empty() {
+                                None
+                            } else {
+                                Some(onion_addr)
+                            },
+                            i2p_address: if i2p_addr.is_empty() {
+                                None
+                            } else {
+                                Some(i2p_addr)
+                            },
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to query bootstrap nodes: {}", e);
+            }
+        }
+
+        if self.rpc_providers.is_empty() {
+            Err(anyhow::anyhow!("On-chain discovery found no RPC providers"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Use manual configuration (for testing only)
