@@ -9,6 +9,7 @@ use sha3::{Digest, Keccak256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::batch::{
@@ -457,24 +458,164 @@ impl ComputeEngine {
         Ok(vec![0u8; 32])
     }
 
+    /// Execute a PyTorch TorchScript model (.pt / .pth) via a Python subprocess.
+    ///
+    /// Using a subprocess avoids linking against LibTorch at compile time (a
+    /// multi-GB download). Node operators who want PyTorch support install
+    /// Python + torch themselves; the node detects availability at runtime.
     async fn execute_pytorch_file(
         &self,
-        _model_path: &PathBuf,
-        _input_path: &PathBuf,
+        model_path: &PathBuf,
+        input_path: &PathBuf,
     ) -> Result<Vec<u8>> {
-        // TODO: Implement PyTorch execution via tch-rs
-        info!("PyTorch execution not yet implemented");
-        Ok(vec![0u8; 32])
+        // Python runner — loads a TorchScript model and returns JSON output
+        // matching the same {"type","shape","values"} schema as the ONNX path.
+        const PYTORCH_RUNNER: &str = r#"
+import sys, json, os
+import torch
+
+model_path, input_path = sys.argv[1], sys.argv[2]
+
+with open(input_path, 'rb') as f:
+    raw = f.read()
+
+try:
+    data = json.loads(raw)
+    if isinstance(data, list):
+        values, shape = data, [1, len(data)]
+    elif isinstance(data, dict):
+        vals = data.get('input') or data.get('data') or data.get('values', [])
+        shape = data.get('shape', [1, max(len(vals), 1)])
+        values = vals
+    else:
+        values, shape = [float(data)], [1, 1]
+except Exception:
+    values, shape = [0.0], [1, 1]
+
+model = torch.jit.load(model_path, map_location='cpu')
+model.eval()
+with torch.no_grad():
+    t = torch.tensor(values, dtype=torch.float32).reshape(shape)
+    out = model(t)
+    out_list = out.flatten().tolist()
+    out_shape = list(out.shape)
+
+print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='')
+"#;
+
+        info!(
+            "Executing PyTorch model via Python subprocess: {:?}",
+            model_path
+        );
+
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                PYTORCH_RUNNER,
+                model_path.to_str().context("Invalid model path")?,
+                input_path.to_str().context("Invalid input path")?,
+            ])
+            .output()
+            .await
+            .context(
+                "Failed to spawn python3 for PyTorch execution — is Python + torch installed?",
+            )?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("PyTorch runner failed: {}", stderr.trim()));
+        }
+
+        let stdout = output.stdout;
+        if stdout.is_empty() {
+            return Err(anyhow::anyhow!("PyTorch runner produced no output"));
+        }
+
+        debug!("PyTorch output: {} bytes", stdout.len());
+        Ok(stdout)
     }
 
+    /// Execute a TensorFlow model (SavedModel directory, .h5, or .pb) via a
+    /// Python subprocess. Same subprocess rationale as PyTorch above.
     async fn execute_tensorflow_file(
         &self,
-        _model_path: &PathBuf,
-        _input_path: &PathBuf,
+        model_path: &PathBuf,
+        input_path: &PathBuf,
     ) -> Result<Vec<u8>> {
-        // TODO: Implement TensorFlow execution
-        info!("TensorFlow execution not yet implemented");
-        Ok(vec![0u8; 32])
+        const TF_RUNNER: &str = r#"
+import sys, json, os
+import numpy as np
+import tensorflow as tf
+
+model_path, input_path = sys.argv[1], sys.argv[2]
+
+with open(input_path, 'rb') as f:
+    raw = f.read()
+
+try:
+    data = json.loads(raw)
+    if isinstance(data, list):
+        values, shape = data, [1, len(data)]
+    elif isinstance(data, dict):
+        vals = data.get('input') or data.get('data') or data.get('values', [])
+        shape = data.get('shape', [1, max(len(vals), 1)])
+        values = vals
+    else:
+        values, shape = [float(data)], [1, 1]
+except Exception:
+    values, shape = [0.0], [1, 1]
+
+arr = np.array(values, dtype=np.float32).reshape(shape)
+
+if os.path.isdir(model_path):
+    model = tf.saved_model.load(model_path)
+    infer = model.signatures.get('serving_default')
+    if infer:
+        key = list(infer.structured_input_signature[1].keys())[0]
+        result = infer(**{key: tf.constant(arr)})
+        out = list(result.values())[0].numpy()
+    else:
+        out = model(arr).numpy()
+else:
+    model = tf.keras.models.load_model(model_path)
+    out = model.predict(arr, verbose=0)
+
+out_list = out.flatten().tolist()
+out_shape = list(out.shape)
+print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='')
+"#;
+
+        info!(
+            "Executing TensorFlow model via Python subprocess: {:?}",
+            model_path
+        );
+
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                TF_RUNNER,
+                model_path.to_str().context("Invalid model path")?,
+                input_path.to_str().context("Invalid input path")?,
+            ])
+            .output()
+            .await
+            .context("Failed to spawn python3 for TensorFlow execution — is Python + tensorflow installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!(
+                "TensorFlow runner failed: {}",
+                stderr.trim()
+            ));
+        }
+
+        let stdout = output.stdout;
+        if stdout.is_empty() {
+            return Err(anyhow::anyhow!("TensorFlow runner produced no output"));
+        }
+
+        debug!("TensorFlow output: {} bytes", stdout.len());
+        Ok(stdout)
     }
 
     /// Get current resource usage
