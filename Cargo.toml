@@ -1,6 +1,6 @@
 [package]
 name = "oarn-node"
-version = "0.1.0"
+version = "0.1.6"
 edition = "2021"
 authors = ["OARN Network Contributors"]
 description = "OARN Network Node - Decentralized AI Research Infrastructure"
