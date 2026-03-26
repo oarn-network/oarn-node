@@ -416,8 +416,15 @@ mod tests {
 
     #[test]
     fn test_node_mode_serialization() {
-        let mode = NodeMode::ValidatorRouted;
-        let serialized = toml::to_string(&mode).unwrap();
+        // TOML requires a table at the top level — wrap the enum in a struct
+        #[derive(Serialize)]
+        struct Wrapper {
+            mode: NodeMode,
+        }
+        let w = Wrapper {
+            mode: NodeMode::ValidatorRouted,
+        };
+        let serialized = toml::to_string(&w).unwrap();
         assert!(serialized.contains("validatorrouted"));
     }
 
