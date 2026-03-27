@@ -886,11 +886,59 @@ fn detect_resources() -> (Option<u64>, Option<u64>) {
     sys.refresh_memory();
     let ram_mb = Some(sys.total_memory() / (1024 * 1024)); // Convert bytes to MB
 
-    // VRAM detection would require GPU-specific libraries
-    // TODO: Implement CUDA/ROCm detection
-    let vram_mb = None;
+    // VRAM detection via nvidia-smi (CUDA) or rocm-smi (ROCm)
+    let vram_mb = detect_vram_nvidia().or_else(detect_vram_rocm);
 
     (vram_mb, ram_mb)
+}
+
+/// Detect VRAM via nvidia-smi (CUDA GPUs).
+/// Returns total VRAM in MB for the first GPU found, or None if CUDA unavailable.
+fn detect_vram_nvidia() -> Option<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // nvidia-smi returns one line per GPU in MiB; take the first GPU
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .next()
+        .and_then(|line| line.trim().parse::<u64>().ok())
+}
+
+/// Detect VRAM via rocm-smi (AMD ROCm GPUs).
+/// Returns total VRAM in MB for the first GPU found, or None if ROCm unavailable.
+fn detect_vram_rocm() -> Option<u64> {
+    // rocm-smi --showmeminfo vram prints lines like:
+    //   GPU[0]          : VRAM Total Memory (B): 17163091968
+    let output = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("VRAM Total Memory (B):") {
+            let bytes: u64 = line
+                .split(':')
+                .last()?
+                .trim()
+                .parse()
+                .ok()?;
+            return Some(bytes / (1024 * 1024));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1052,8 +1100,10 @@ mod tests {
     fn test_detect_resources() {
         let (vram, ram) = detect_resources();
 
-        // VRAM detection not implemented, should be None
-        assert!(vram.is_none());
+        // VRAM is Some if nvidia-smi/rocm-smi is available, None otherwise — both are valid
+        if let Some(v) = vram {
+            assert!(v > 0, "detected VRAM should be > 0 MB");
+        }
 
         // RAM should be detected
         assert!(ram.is_some());
