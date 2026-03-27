@@ -6,10 +6,11 @@
 use anyhow::{Context, Result};
 use ethers::{
     prelude::*,
-    providers::{Http, Middleware, Provider},
+    providers::{Http, Middleware, Provider, Ws},
     signers::LocalWallet,
-    types::{Address, TxHash, U256},
+    types::{Address, Filter, TxHash, U256},
 };
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -836,10 +837,122 @@ impl BlockchainClient {
         })
     }
 
-    /// Subscribe to contract events
+    /// Subscribe to contract events (legacy stub — use spawn_event_listener instead)
     pub async fn subscribe_events(&self) -> Result<()> {
-        // TODO: Set up event subscription via WebSocket or polling
         Ok(())
+    }
+
+    /// Derive a WebSocket URL from an HTTP RPC URL.
+    /// e.g. "https://foo.bar/rpc" → "wss://foo.bar/rpc"
+    fn derive_ws_url(http_url: &str) -> String {
+        if http_url.starts_with("https://") {
+            http_url.replacen("https://", "wss://", 1)
+        } else if http_url.starts_with("http://") {
+            http_url.replacen("http://", "ws://", 1)
+        } else {
+            http_url.to_string()
+        }
+    }
+
+    /// Spawn a background task that subscribes to TaskRegistryV2 events via WebSocket
+    /// and feeds them into the existing `event_tx` channel.
+    ///
+    /// Falls back gracefully if the WS connection cannot be established (e.g. the
+    /// public Arbitrum Sepolia HTTP RPC doesn't expose WS) — polling continues working.
+    pub fn spawn_event_listener(&self, config: &Config) {
+        // Resolve WebSocket URL
+        let ws_url = config
+            .blockchain
+            .ws_url
+            .clone()
+            .or_else(|| config.blockchain.manual_rpc_url.as_deref().map(Self::derive_ws_url))
+            .unwrap_or_else(|| {
+                // Fallback: derive from the public Arbitrum Sepolia RPC
+                Self::derive_ws_url("https://sepolia-rollup.arbitrum.io/rpc")
+            });
+
+        let task_registry_v2_address = self.task_registry_v2_address;
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            info!("Connecting WebSocket event listener: {}", ws_url);
+
+            let ws_provider = match Provider::<Ws>::connect(&ws_url).await {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    warn!("WebSocket connection failed ({}): event polling remains active", e);
+                    return;
+                }
+            };
+
+            let contract_addr = match task_registry_v2_address {
+                Some(a) => a,
+                None => {
+                    warn!("TaskRegistryV2 address unknown — skipping WS event subscription");
+                    return;
+                }
+            };
+
+            // TaskCreated(uint256 indexed taskId, ...)
+            let task_created_sig =
+                ethers::core::abi::AbiParser::default()
+                    .parse_event("TaskCreated(uint256 indexed taskId, address indexed requester, bytes32 modelHash, uint256 rewardPerNode, uint256 requiredNodes, uint8 consensusType)")
+                    .expect("valid event sig");
+            let task_created_topic = task_created_sig.signature();
+
+            // RewardDistributed(uint256 indexed taskId, address indexed node, uint256 amount, bool matchedConsensus)
+            let reward_sig =
+                ethers::core::abi::AbiParser::default()
+                    .parse_event("RewardDistributed(uint256 indexed taskId, address indexed node, uint256 amount, bool matchedConsensus)")
+                    .expect("valid event sig");
+            let reward_topic = reward_sig.signature();
+
+            let filter = Filter::new()
+                .address(contract_addr)
+                .topic0(vec![task_created_topic, reward_topic]);
+
+            let mut stream = match ws_provider.subscribe_logs(&filter).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to subscribe to contract logs ({}): polling remains active", e);
+                    return;
+                }
+            };
+
+            info!("WebSocket event subscription active for TaskRegistryV2 {:?}", contract_addr);
+
+            while let Some(log) = stream.next().await {
+                if log.topics.is_empty() {
+                    continue;
+                }
+
+                // Extract task ID from first indexed param (topics[1])
+                let task_id = log
+                    .topics
+                    .get(1)
+                    .map(|t| U256::from(t.as_bytes()).as_u64())
+                    .unwrap_or(0);
+
+                let topic0 = log.topics[0];
+
+                let event = if topic0 == task_created_topic {
+                    debug!("WS: TaskCreated event — task_id={}", task_id);
+                    BlockchainEvent::TaskCreated(task_id)
+                } else if topic0 == reward_topic {
+                    debug!("WS: RewardDistributed event — task_id={}", task_id);
+                    BlockchainEvent::RewardReceived(task_id)
+                } else {
+                    continue;
+                };
+
+                if event_tx.send(event).await.is_err() {
+                    // Receiver dropped — node is shutting down
+                    break;
+                }
+            }
+
+            warn!("WebSocket event stream ended — polling remains active");
+        });
     }
 
     /// Verify RPC provider is healthy

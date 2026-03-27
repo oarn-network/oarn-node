@@ -133,6 +133,9 @@ pub struct BlockchainConfig {
     /// Manual RPC URL (only for testing, prefer discovery)
     pub manual_rpc_url: Option<String>,
 
+    /// WebSocket RPC URL for event subscriptions (optional; derived from manual_rpc_url if absent)
+    pub ws_url: Option<String>,
+
     /// Number of RPC providers to use for redundancy
     #[serde(default = "default_rpc_redundancy")]
     pub rpc_redundancy: usize,
@@ -159,6 +162,7 @@ impl Default for BlockchainConfig {
             chain_id: default_chain_id(),
             rpc_discovery: default_rpc_discovery(),
             manual_rpc_url: None,
+            ws_url: None,
             rpc_redundancy: default_rpc_redundancy(),
             contracts: None,
         }

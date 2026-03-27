@@ -131,6 +131,9 @@ async fn run_node(config: Config) -> Result<()> {
     // Step 6: Load wallet for signing transactions
     let wallet = load_wallet(&config)?;
 
+    // Step 7: Spawn WebSocket event listener (non-blocking; polling continues as fallback)
+    blockchain.spawn_event_listener(&config);
+
     info!("Node started successfully!");
     info!("Listening on: {:?}", config.network.listen_addresses);
     info!("{}", "-".repeat(50));
