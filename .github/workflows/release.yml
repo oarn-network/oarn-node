@@ -24,6 +24,11 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
 
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            use_cross: true
+
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -52,11 +57,15 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        if: matrix.os == 'ubuntu-latest' && !matrix.use_cross
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libudev-dev libdbus-1-dev
 
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: ${{ matrix.use_cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -117,7 +126,15 @@ jobs:
 
             ### Quick Install
 
-            **Linux (64-bit)**
+            **Linux 64-bit — static (Ubuntu 22.04+, recommended)**
+            ```bash
+            tar -xzf oarn-node-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
+            chmod +x oarn-node
+            ./oarn-node config init
+            ./oarn-node start
+            ```
+
+            **Linux 64-bit — glibc (Ubuntu 24.04+)**
             ```bash
             tar -xzf oarn-node-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
             chmod +x oarn-node
@@ -150,7 +167,8 @@ jobs:
 
             | File | Platform |
             |------|----------|
-            | `*-x86_64-unknown-linux-gnu.tar.gz` | Linux 64-bit |
+            | `*-x86_64-unknown-linux-gnu.tar.gz` | Linux 64-bit (glibc, Ubuntu 24.04+) |
+            | `*-x86_64-unknown-linux-musl.tar.gz` | Linux 64-bit (static, Ubuntu 22.04+, any distro) |
             | `*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon (M1/M2/M3) |
             | `*-x86_64-pc-windows-msvc.zip` | Windows 64-bit |
 
