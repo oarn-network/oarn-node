@@ -40,9 +40,9 @@ ethers-contract = "2.0"
 # IPFS
 ipfs-api-backend-hyper = { version = "0.6", features = ["with-hyper-rustls"] }
 
-# ONNX Runtime for AI inference
-ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
-ndarray = "0.16"
+# ONNX Runtime for AI inference (optional — requires glibc 2.38+, enable with --features compute)
+ort = { version = "2.0.0-rc.9", features = ["download-binaries"], optional = true }
+ndarray = { version = "0.16", optional = true }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
@@ -97,6 +97,7 @@ mockall = "0.12"
 
 [features]
 default = []
+compute = ["dep:ort", "dep:ndarray"]  # ONNX inference — requires glibc 2.38+
 tor = [] # Enable when arti is added
 
 [[bin]]

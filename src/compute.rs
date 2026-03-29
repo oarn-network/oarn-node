@@ -3,6 +3,7 @@
 //! Handles AI model execution using ONNX Runtime.
 
 use anyhow::{Context, Result};
+#[cfg(feature = "compute")]
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use rayon::prelude::*;
 use sha3::{Digest, Keccak256};
@@ -225,6 +226,7 @@ impl ComputeEngine {
         }
     }
 
+    #[cfg(feature = "compute")]
     async fn execute_onnx_file(
         &self,
         model_path: &PathBuf,
@@ -250,7 +252,17 @@ impl ComputeEngine {
         Ok(result)
     }
 
+    #[cfg(not(feature = "compute"))]
+    async fn execute_onnx_file(
+        &self,
+        _model_path: &PathBuf,
+        _input_path: &PathBuf,
+    ) -> Result<Vec<u8>> {
+        anyhow::bail!("ONNX compute not available in this build (requires --features compute)")
+    }
+
     /// Run ONNX inference with simplified API
+    #[cfg(feature = "compute")]
     fn run_onnx_inference(&self, session: &mut Session, input_bytes: &[u8]) -> Result<Vec<u8>> {
         // Get input info
         let inputs = session.inputs();
@@ -298,6 +310,7 @@ impl ComputeEngine {
     }
 
     /// Helper to run inference with a prepared tensor
+    #[cfg(feature = "compute")]
     fn run_inference_with_tensor(
         &self,
         session: &mut Session,
@@ -392,6 +405,7 @@ impl ComputeEngine {
     }
 
     /// Extract tensor output as JSON bytes for human-readable results
+    #[cfg(feature = "compute")]
     fn extract_tensor_bytes(&self, output: &ort::value::Value) -> Result<Vec<u8>> {
         // Try f32 tensor - most common for inference outputs
         if let Ok(tensor) = output.try_extract_tensor::<f32>() {
@@ -703,6 +717,7 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
     }
 
     /// Execute ONNX model directly from memory
+    #[cfg(feature = "compute")]
     async fn execute_onnx_memory(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
         info!(
             "Loading ONNX model from memory ({} bytes)",
@@ -722,6 +737,11 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
         info!("ONNX inference completed, output: {} bytes", result.len());
 
         Ok(result)
+    }
+
+    #[cfg(not(feature = "compute"))]
+    async fn execute_onnx_memory(&self, _model_data: &[u8], _input_data: &[u8]) -> Result<Vec<u8>> {
+        anyhow::bail!("ONNX compute not available in this build (requires --features compute)")
     }
 
     /// Hash a result for on-chain submission
@@ -858,7 +878,7 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
         hasher.finalize().to_vec()
     }
 
-    /// Synchronous ONNX execution
+    #[cfg(feature = "compute")]
     fn execute_onnx_sync(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
         let mut session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -866,6 +886,11 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
             .context("Failed to load ONNX model")?;
 
         self.run_onnx_inference(&mut session, input_data)
+    }
+
+    #[cfg(not(feature = "compute"))]
+    fn execute_onnx_sync(&self, _model_data: &[u8], _input_data: &[u8]) -> Result<Vec<u8>> {
+        anyhow::bail!("ONNX compute not available in this build (requires --features compute)")
     }
 }
 
