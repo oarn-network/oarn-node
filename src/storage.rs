@@ -228,7 +228,7 @@ impl IpfsStorage {
         Ok(size)
     }
 
-    /// Clean cache if over limit
+    /// Clean cache if over limit using LRU eviction (oldest mtime first)
     pub async fn clean_cache(&self) -> Result<()> {
         let size = self.cache_size().await?;
         let max_bytes = self.max_cache_mb * 1024 * 1024;
@@ -240,9 +240,41 @@ impl IpfsStorage {
                 self.max_cache_mb
             );
 
-            // TODO: Implement LRU cache eviction
-            // For now, just log a warning
-            tracing::warn!("Cache cleaning not yet implemented");
+            // Collect all cache files with their modification time and size
+            let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+            let mut dir = fs::read_dir(&self.cache_dir).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                if let Ok(metadata) = entry.metadata().await {
+                    if metadata.is_file() {
+                        let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                        entries.push((entry.path(), metadata.len(), mtime));
+                    }
+                }
+            }
+
+            // Sort oldest first for LRU eviction
+            entries.sort_by_key(|(_, _, mtime)| *mtime);
+
+            let mut current_size = size;
+            for (path, file_size, _) in entries {
+                if current_size <= max_bytes {
+                    break;
+                }
+                match fs::remove_file(&path).await {
+                    Ok(()) => {
+                        info!("Evicted cache file: {:?}", path);
+                        current_size = current_size.saturating_sub(file_size);
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove cache file {:?}: {}", path, e);
+                    }
+                }
+            }
+
+            info!(
+                "Cache cleaned, new size: {} MB",
+                current_size / (1024 * 1024)
+            );
         }
 
         Ok(())
