@@ -85,6 +85,33 @@ impl ModelRequirements {
     }
 }
 
+/// Detect inference framework from model magic bytes (best-effort heuristic).
+///
+/// | Framework | Signature                          | Notes                        |
+/// |-----------|------------------------------------|------------------------------|
+/// | PyTorch   | `PK\x03\x04` (ZIP magic)           | Modern .pt / .pth (zip-based)|
+/// | PyTorch   | `\x80\x02` or `\x80\x04` (pickle) | Legacy pickle .pt            |
+/// | TF/Keras  | `\x89HDF`                          | HDF5 .h5 Keras model         |
+/// | ONNX      | first byte `\x08` or `\x0a`        | Protobuf field encoding      |
+pub fn detect_framework(data: &[u8]) -> Framework {
+    if data.len() < 4 {
+        return Framework::Unknown("too small".to_string());
+    }
+    if data.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+        return Framework::PyTorch; // ZIP-based .pt
+    }
+    if data.starts_with(&[0x80, 0x02]) || data.starts_with(&[0x80, 0x04]) {
+        return Framework::PyTorch; // pickle-based .pt
+    }
+    if data.starts_with(&[0x89, 0x48, 0x44, 0x46]) {
+        return Framework::TensorFlow; // HDF5 .h5
+    }
+    if data[0] == 0x08 || data[0] == 0x0A {
+        return Framework::ONNX; // protobuf varint encoding
+    }
+    Framework::Unknown("unrecognised magic bytes".to_string())
+}
+
 /// Parse memory string like "8GB" or "4096MB"
 fn parse_memory_string(s: &str) -> Option<u64> {
     let s = s.to_uppercase();
@@ -642,21 +669,16 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
         }
     }
 
-    /// Check if this node can handle a task from the blockchain
+    /// Check if this node can handle a task from the blockchain.
     pub fn can_handle_task(&self, _task: &TaskInfo) -> bool {
-        // For now, check concurrent task limit
-        // TODO: Parse model requirements from task metadata
         if self.active_tasks >= self.concurrent_tasks {
             debug!("At concurrent task limit: {}", self.concurrent_tasks);
             return false;
         }
-
-        // Assume we can handle ONNX tasks
-        if self.supported_frameworks.contains(&Framework::ONNX) {
-            return true;
-        }
-
-        false
+        // Accept tasks for any real framework we support
+        self.supported_frameworks.iter().any(|f| {
+            matches!(f, Framework::ONNX | Framework::PyTorch | Framework::TensorFlow)
+        })
     }
 
     /// Execute a task with raw model and input data
@@ -697,8 +719,46 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
             }
         }
 
+        // Try PyTorch or TensorFlow based on magic-byte detection
+        match detect_framework(model_data) {
+            Framework::PyTorch => {
+                match self.execute_pytorch_memory(model_data, input_data).await {
+                    Ok(r) => {
+                        info!("PyTorch inference succeeded, output: {} bytes", r.len());
+                        return Ok(r);
+                    }
+                    Err(e) => warn!("PyTorch inference failed: {}. Falling back to placeholder.", e),
+                }
+            }
+            Framework::TensorFlow => {
+                match self.execute_tensorflow_memory(model_data, input_data).await {
+                    Ok(r) => {
+                        info!("TensorFlow inference succeeded, output: {} bytes", r.len());
+                        return Ok(r);
+                    }
+                    Err(e) => warn!("TensorFlow inference failed: {}. Falling back to placeholder.", e),
+                }
+            }
+            _ => {}
+        }
+
         // Fallback: Placeholder mode
         self.execute_placeholder(model_data, input_data)
+    }
+
+    /// Execute a model with an explicit framework hint (skips magic-byte detection).
+    pub async fn execute_with_framework(
+        &self,
+        model_data: &[u8],
+        input_data: &[u8],
+        framework: &Framework,
+    ) -> Result<Vec<u8>> {
+        match framework {
+            Framework::ONNX => self.execute_onnx_memory(model_data, input_data).await,
+            Framework::PyTorch => self.execute_pytorch_memory(model_data, input_data).await,
+            Framework::TensorFlow => self.execute_tensorflow_memory(model_data, input_data).await,
+            Framework::Unknown(_) => self.execute(model_data, input_data).await,
+        }
     }
 
     /// Placeholder execution - deterministic hash of model + input
@@ -714,6 +774,66 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
 
         info!("Task execution completed (placeholder mode)");
         Ok(result)
+    }
+
+    /// Write model + input bytes to temp files, run PyTorch subprocess, clean up.
+    async fn execute_pytorch_memory(
+        &self,
+        model_data: &[u8],
+        input_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let hash = {
+            let mut h = Keccak256::new();
+            h.update(model_data);
+            hex::encode(&h.finalize()[..8])
+        };
+        let model_path = PathBuf::from(format!("/tmp/oarn_model_{}.pt", hash));
+        let input_path = PathBuf::from(format!("/tmp/oarn_input_{}.json", hash));
+
+        tokio::fs::write(&model_path, model_data)
+            .await
+            .context("Failed to write PyTorch model to temp file")?;
+        tokio::fs::write(&input_path, input_data)
+            .await
+            .context("Failed to write input to temp file")?;
+
+        let result = self.execute_pytorch_file(&model_path, &input_path).await;
+
+        let _ = tokio::fs::remove_file(&model_path).await;
+        let _ = tokio::fs::remove_file(&input_path).await;
+
+        result
+    }
+
+    /// Write model + input bytes to temp files, run TensorFlow subprocess, clean up.
+    async fn execute_tensorflow_memory(
+        &self,
+        model_data: &[u8],
+        input_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let hash = {
+            let mut h = Keccak256::new();
+            h.update(model_data);
+            hex::encode(&h.finalize()[..8])
+        };
+        // Use .h5 for HDF5 Keras models, .pb for protobuf SavedModel
+        let ext = if model_data.starts_with(&[0x89, 0x48, 0x44, 0x46]) { "h5" } else { "pb" };
+        let model_path = PathBuf::from(format!("/tmp/oarn_model_{}.{}", hash, ext));
+        let input_path = PathBuf::from(format!("/tmp/oarn_input_{}.json", hash));
+
+        tokio::fs::write(&model_path, model_data)
+            .await
+            .context("Failed to write TF model to temp file")?;
+        tokio::fs::write(&input_path, input_data)
+            .await
+            .context("Failed to write input to temp file")?;
+
+        let result = self.execute_tensorflow_file(&model_path, &input_path).await;
+
+        let _ = tokio::fs::remove_file(&model_path).await;
+        let _ = tokio::fs::remove_file(&input_path).await;
+
+        result
     }
 
     /// Execute ONNX model directly from memory
@@ -848,26 +968,114 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
         }
     }
 
-    /// Synchronous execution for use in Rayon parallel context
+    /// Synchronous execution for use in Rayon parallel context.
     fn execute_sync(&self, model_data: &[u8], input_data: &[u8]) -> Vec<u8> {
-        // Skip very small "models" (likely JSON metadata)
         if model_data.len() < 100 {
             return self.execute_placeholder_sync(model_data, input_data);
         }
 
-        // Try to run as ONNX model first
+        // Try ONNX first
         match self.execute_onnx_sync(model_data, input_data) {
-            Ok(result) => {
-                debug!("ONNX inference succeeded, output: {} bytes", result.len());
-                return result;
-            }
-            Err(e) => {
-                debug!("ONNX inference failed: {}", e);
-            }
+            Ok(r) => { debug!("ONNX sync inference succeeded: {} bytes", r.len()); return r; }
+            Err(e) => { debug!("ONNX sync failed: {}", e); }
         }
 
-        // Fallback: deterministic hash-based placeholder
+        // Detect and try PyTorch / TensorFlow (subprocess, blocking)
+        match detect_framework(model_data) {
+            Framework::PyTorch => {
+                match self.execute_pytorch_sync(model_data, input_data) {
+                    Ok(r) => { debug!("PyTorch sync inference succeeded: {} bytes", r.len()); return r; }
+                    Err(e) => { warn!("PyTorch sync failed: {}", e); }
+                }
+            }
+            Framework::TensorFlow => {
+                match self.execute_tensorflow_sync(model_data, input_data) {
+                    Ok(r) => { debug!("TF sync inference succeeded: {} bytes", r.len()); return r; }
+                    Err(e) => { warn!("TF sync failed: {}", e); }
+                }
+            }
+            _ => {}
+        }
+
         self.execute_placeholder_sync(model_data, input_data)
+    }
+
+    /// Synchronous PyTorch execution for Rayon context (uses std::process::Command).
+    fn execute_pytorch_sync(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
+        let hash = hex::encode(&{
+            let mut h = Keccak256::new();
+            h.update(model_data);
+            h.finalize()[..8].to_vec()
+        });
+        let model_path = format!("/tmp/oarn_sync_model_{}.pt", hash);
+        let input_path = format!("/tmp/oarn_sync_input_{}.json", hash);
+
+        std::fs::write(&model_path, model_data)
+            .context("Failed to write PyTorch model (sync)")?;
+        std::fs::write(&input_path, input_data)
+            .context("Failed to write input (sync)")?;
+
+        let result = self.run_python_subprocess_sync(
+            include_str!("../scripts/pytorch_runner.py"),
+            &model_path,
+            &input_path,
+            "PyTorch",
+        );
+
+        let _ = std::fs::remove_file(&model_path);
+        let _ = std::fs::remove_file(&input_path);
+        result
+    }
+
+    /// Synchronous TensorFlow execution for Rayon context.
+    fn execute_tensorflow_sync(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
+        let hash = hex::encode(&{
+            let mut h = Keccak256::new();
+            h.update(model_data);
+            h.finalize()[..8].to_vec()
+        });
+        let ext = if model_data.starts_with(&[0x89, 0x48, 0x44, 0x46]) { "h5" } else { "pb" };
+        let model_path = format!("/tmp/oarn_sync_model_{}.{}", hash, ext);
+        let input_path = format!("/tmp/oarn_sync_input_{}.json", hash);
+
+        std::fs::write(&model_path, model_data)
+            .context("Failed to write TF model (sync)")?;
+        std::fs::write(&input_path, input_data)
+            .context("Failed to write input (sync)")?;
+
+        let result = self.run_python_subprocess_sync(
+            include_str!("../scripts/tensorflow_runner.py"),
+            &model_path,
+            &input_path,
+            "TensorFlow",
+        );
+
+        let _ = std::fs::remove_file(&model_path);
+        let _ = std::fs::remove_file(&input_path);
+        result
+    }
+
+    /// Shared blocking subprocess helper for Rayon context.
+    fn run_python_subprocess_sync(
+        &self,
+        script: &str,
+        model_path: &str,
+        input_path: &str,
+        label: &str,
+    ) -> Result<Vec<u8>> {
+        let output = std::process::Command::new("python3")
+            .args(["-c", script, model_path, input_path])
+            .output()
+            .with_context(|| format!("Failed to spawn python3 for {} (sync)", label))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("{} runner (sync) failed: {}", label, stderr.trim());
+        }
+        if output.stdout.is_empty() {
+            anyhow::bail!("{} runner (sync) produced no output", label);
+        }
+        Ok(output.stdout)
     }
 
     /// Synchronous placeholder execution
