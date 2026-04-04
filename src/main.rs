@@ -164,9 +164,14 @@ async fn run_node(config: Config) -> Result<()> {
                 }
             }
 
-            // Poll for available tasks (V1 and V2)
+            // Poll for available tasks (V1 and V2).
+            // Skipped when the WebSocket event stream is healthy; the WS path
+            // delivers TaskCreated events in real-time so polling is redundant.
+            // Polling acts as a safety-net fallback when WS is disconnected.
             _ = task_poll_interval.tick() => {
-                if let Some(ref wallet) = wallet {
+                if blockchain.is_ws_active() {
+                    debug!("WS active — skipping HTTP task poll");
+                } else if let Some(ref wallet) = wallet {
                     // Poll V2 tasks first (consensus tasks)
                     if let Err(e) = poll_and_process_tasks_v2(&blockchain, &storage, &compute, wallet).await {
                         debug!("V2 Task polling error: {}", e);
