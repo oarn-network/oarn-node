@@ -182,6 +182,12 @@ async fn run_node(config: Config) -> Result<()> {
             _ = peer_discovery_interval.tick() => {
                 debug!("Running periodic peer discovery...");
                 network.find_peers();
+                if network.is_bootstrap_complete() {
+                    // Publish our multiaddr so other nodes can find us,
+                    // then query for peers published by other OARN nodes.
+                    network.publish_peer_info();
+                    network.query_oarn_peers();
+                }
             }
 
             // Display network stats periodically

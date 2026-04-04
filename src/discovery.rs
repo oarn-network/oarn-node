@@ -12,8 +12,15 @@ use ethers::{
     providers::{Http, Middleware, Provider},
     types::Address,
 };
+use futures::StreamExt;
+use libp2p::{
+    kad, noise, tcp, yamux,
+    swarm::SwarmEvent,
+    Multiaddr, PeerId,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -390,19 +397,223 @@ impl Discovery {
         }
     }
 
-    /// Discover infrastructure via DHT
+    /// Discover infrastructure via DHT (Kademlia).
     ///
-    /// NOTE: Full DHT discovery requires a running libp2p swarm (Kademlia).
-    /// The swarm is initialised in network.rs AFTER discovery completes, so
-    /// DHT-based bootstrap cannot be wired here without a circular dependency.
-    /// The correct integration point is network.rs: once the swarm is live,
-    /// query `/oarn/bootstrap` and `/oarn/rpc` keys and call
-    /// `discovery.add_rpc_provider()` / `discovery.add_bootstrap_node()`.
+    /// Builds a minimal temporary libp2p swarm (TCP + Noise + Yamux + Kademlia),
+    /// connects to seed peers, and queries the `/oarn/peers/v1` DHT record to
+    /// find other OARN bootstrap nodes.
+    ///
+    /// Seed priority:
+    ///   1. `[network.discovery].manual_bootstrap` from config
+    ///   2. Well-known IPFS public bootstrap peers (fallback — same Kademlia DHT)
+    ///
+    /// The temp swarm is dropped after discovery. The real swarm in network.rs
+    /// then continues DHT operations (publishing peer info, periodic queries).
     async fn discover_via_dht(&mut self) -> Result<()> {
-        warn!("DHT discovery requires a running swarm — falling through to on-chain");
-        Err(anyhow::anyhow!(
-            "DHT discovery not available at pre-swarm bootstrap stage"
-        ))
+        info!("Starting DHT peer discovery...");
+
+        // ── Seed peers ─────────────────────────────────────────────────────────
+        // Well-known stable IPFS bootstrap peers (IP-based, no DNS needed).
+        // They serve as DHT entry points so we can find OARN records.
+        const IPFS_BOOTSTRAP: &[&str] = &[
+            "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+            "/ip4/104.236.179.241/tcp/4001/p2p/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",
+            "/ip4/128.199.219.111/tcp/4001/p2p/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",
+            "/ip4/162.243.248.213/tcp/4001/p2p/QmSoLueR4xBeUbY9NziQvnPMqhAfK31SfNPGCGUfxf6HtL",
+        ];
+
+        // Parse manual bootstrap seeds from config first, then IPFS fallback
+        let mut seeds: Vec<(Multiaddr, PeerId)> = Vec::new();
+
+        let mut all_addrs: Vec<String> = self.config.network.discovery.manual_bootstrap.clone();
+        for s in IPFS_BOOTSTRAP.iter() {
+            all_addrs.push(s.to_string());
+        }
+
+        for addr_str in &all_addrs {
+            if let Ok(ma) = addr_str.parse::<Multiaddr>() {
+                // Extract /p2p/<peer_id> component
+                let peer_id = ma.iter().find_map(|proto| {
+                    if let libp2p::multiaddr::Protocol::P2p(id) = proto {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(peer_id) = peer_id {
+                    seeds.push((ma, peer_id));
+                }
+            }
+        }
+
+        if seeds.is_empty() {
+            return Err(anyhow::anyhow!("DHT: no usable seed peers found"));
+        }
+
+        info!("DHT: connecting to {} seed peer(s)...", seeds.len());
+
+        // ── Build minimal temp swarm ────────────────────────────────────────────
+        let local_key = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(local_key.public());
+
+        let store = kad::store::MemoryStore::new(local_peer_id);
+        let mut kad_config = kad::Config::default();
+        kad_config.set_record_ttl(Some(Duration::from_secs(3600)));
+
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|_| {
+                Ok(kad::Behaviour::with_config(local_peer_id, store, kad_config))
+            })?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+            .build();
+
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+        // Add seeds to routing table and dial them
+        for (addr, peer_id) in &seeds {
+            swarm.behaviour_mut().add_address(peer_id, addr.clone());
+            let _ = swarm.dial(addr.clone());
+        }
+
+        // Start Kademlia bootstrap
+        if let Err(e) = swarm.behaviour_mut().bootstrap() {
+            return Err(anyhow::anyhow!("DHT bootstrap failed: {}", e));
+        }
+
+        // ── Event loop ─────────────────────────────────────────────────────────
+        let oarn_key = kad::RecordKey::new(b"/oarn/peers/v1");
+        let mut bootstrap_done = false;
+        let mut get_query_id: Option<libp2p::kad::QueryId> = None;
+        let mut found_nodes: Vec<BootstrapNode> = Vec::new();
+
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut deadline => {
+                    warn!("DHT discovery timed out after 30s");
+                    break;
+                }
+                event = swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                            result, id, ..
+                        }) => {
+                            match result {
+                                // Bootstrap complete — now query for OARN peers
+                                kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk {
+                                    num_remaining: 0, ..
+                                })) => {
+                                    info!("DHT bootstrap complete, querying OARN peer record...");
+                                    bootstrap_done = true;
+                                    let qid = swarm.behaviour_mut().get_record(oarn_key.clone());
+                                    get_query_id = Some(qid);
+                                }
+                                kad::QueryResult::Bootstrap(Ok(_)) => {
+                                    // Bootstrap still in progress
+                                }
+                                kad::QueryResult::Bootstrap(Err(e)) => {
+                                    warn!("DHT bootstrap error: {:?}", e);
+                                    // Try querying anyway if we have any connections
+                                    if !bootstrap_done {
+                                        bootstrap_done = true;
+                                        let qid = swarm.behaviour_mut().get_record(oarn_key.clone());
+                                        get_query_id = Some(qid);
+                                    }
+                                }
+                                // OARN peers record found
+                                kad::QueryResult::GetRecord(Ok(
+                                    kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+                                        record, ..
+                                    }),
+                                )) => {
+                                    if let Ok(nodes) =
+                                        serde_json::from_slice::<Vec<BootstrapNode>>(&record.value)
+                                    {
+                                        info!("DHT: found {} OARN peer(s) in record", nodes.len());
+                                        found_nodes.extend(nodes);
+                                    } else {
+                                        debug!("DHT: /oarn/peers/v1 record has unrecognised format");
+                                    }
+                                }
+                                // Query finished (with or without records)
+                                kad::QueryResult::GetRecord(Ok(
+                                    kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
+                                )) => {
+                                    if get_query_id.map_or(false, |qid| qid == id) {
+                                        debug!("DHT: GetRecord query finished");
+                                        break;
+                                    }
+                                }
+                                kad::QueryResult::GetRecord(Err(e)) => {
+                                    if get_query_id.map_or(false, |qid| qid == id) {
+                                        debug!("DHT: GetRecord failed: {:?}", e);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            debug!("DHT temp swarm connected to: {}", peer_id);
+                        }
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            debug!("DHT temp swarm listening on: {}", address);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ── Process results ────────────────────────────────────────────────────
+        let discovered = found_nodes.len();
+        for node in found_nodes {
+            info!("DHT discovered OARN peer: {}", node.peer_id);
+            self.bootstrap_nodes.push(node);
+        }
+
+        // Also add manual RPC if configured
+        if let Some(rpc_url) = &self.config.blockchain.manual_rpc_url {
+            if !self.rpc_providers.iter().any(|p| p.endpoint == *rpc_url) {
+                self.rpc_providers.push(RpcProvider {
+                    endpoint: rpc_url.clone(),
+                    onion_endpoint: None,
+                    stake: 0,
+                    uptime: 10000,
+                });
+            }
+        }
+
+        if discovered == 0 && self.bootstrap_nodes.is_empty() {
+            Err(anyhow::anyhow!(
+                "DHT discovery found no OARN peers (record /oarn/peers/v1 not yet published)"
+            ))
+        } else {
+            info!(
+                "DHT discovery complete: {} OARN peer(s) found",
+                self.bootstrap_nodes.len()
+            );
+            Ok(())
+        }
+    }
+
+    /// Add a bootstrap node (called from network.rs after DHT query)
+    pub fn add_bootstrap_node(&mut self, node: BootstrapNode) {
+        if !self.bootstrap_nodes.iter().any(|n| n.peer_id == node.peer_id) {
+            self.bootstrap_nodes.push(node);
+        }
+    }
+
+    /// Add an RPC provider (called from network.rs after DHT query)
+    pub fn add_rpc_provider(&mut self, provider: RpcProvider) {
+        if !self.rpc_providers.iter().any(|p| p.endpoint == provider.endpoint) {
+            self.rpc_providers.push(provider);
+        }
     }
 
     /// Discover infrastructure via on-chain OARNRegistry contract.

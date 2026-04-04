@@ -55,6 +55,10 @@ pub struct P2PNetwork {
     event_rx: mpsc::Receiver<NetworkEvent>,
     discovered_peers: HashSet<PeerId>,
     bootstrap_complete: bool,
+    /// Our confirmed listen addresses (populated as NewListenAddr events arrive)
+    listen_addrs: Vec<Multiaddr>,
+    /// Whether we have already published our peer info to the DHT this session
+    dht_published: bool,
 }
 
 impl P2PNetwork {
@@ -182,6 +186,8 @@ impl P2PNetwork {
             event_rx,
             discovered_peers: HashSet::new(),
             bootstrap_complete,
+            listen_addrs: Vec::new(),
+            dht_published: false,
         })
     }
 
@@ -259,6 +265,7 @@ impl P2PNetwork {
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on: {}", address);
+                self.listen_addrs.push(address);
                 None
             }
             _ => None,
@@ -300,6 +307,51 @@ impl P2PNetwork {
             kad::Event::RoutablePeer { peer, address } => {
                 info!("Discovered routable peer: {} at {}", peer, address);
             }
+            kad::Event::OutboundQueryProgressed { result, .. } => match result {
+                // Already handled in the outer match arm above for Bootstrap/GetClosestPeers;
+                // handle GetRecord and PutRecord here.
+                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
+                    kad::PeerRecord { record, .. },
+                ))) => {
+                    // Try to parse as a BootstrapNode published by another OARN peer
+                    if let Ok(node) =
+                        serde_json::from_slice::<crate::discovery::BootstrapNode>(&record.value)
+                    {
+                        if let (Ok(addr), Ok(peer_id)) = (
+                            node.multiaddr.parse::<Multiaddr>(),
+                            node.peer_id.parse::<PeerId>(),
+                        ) {
+                            if peer_id != *self.swarm.local_peer_id()
+                                && !self.discovered_peers.contains(&peer_id)
+                            {
+                                info!("DHT record: discovered OARN peer {}", peer_id);
+                                self.swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .add_address(&peer_id, addr.clone());
+                                if let Err(e) = self.swarm.dial(addr) {
+                                    debug!("Failed to dial DHT peer {}: {}", peer_id, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                kad::QueryResult::GetRecord(Ok(
+                    kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
+                )) => {
+                    debug!("DHT GetRecord query finished");
+                }
+                kad::QueryResult::GetRecord(Err(e)) => {
+                    debug!("DHT GetRecord failed: {:?}", e);
+                }
+                kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
+                    debug!("DHT record published: {:?}", key);
+                }
+                kad::QueryResult::PutRecord(Err(e)) => {
+                    warn!("DHT record publish failed: {:?}", e);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -406,6 +458,70 @@ impl P2PNetwork {
             .kademlia
             .get_closest_peers(random_peer);
         debug!("Initiated DHT peer discovery");
+    }
+
+    /// Publish our peer info to the OARN DHT record.
+    ///
+    /// Key: `/oarn/peer/<peer_id>` — each node owns its own record so there
+    /// are no write conflicts. Value: JSON-serialised BootstrapNode.
+    /// Called once after DHT bootstrap completes; the Kademlia replication
+    /// interval (5 min) keeps the record alive automatically.
+    pub fn publish_peer_info(&mut self) {
+        if self.listen_addrs.is_empty() {
+            debug!("DHT publish skipped: no confirmed listen addresses yet");
+            return;
+        }
+
+        let peer_id_str = self.swarm.local_peer_id().to_string();
+
+        // Use the first confirmed listen address, appending /p2p/<peer_id>
+        let multiaddr = format!("{}/p2p/{}", self.listen_addrs[0], peer_id_str);
+
+        let node = crate::discovery::BootstrapNode {
+            peer_id: peer_id_str.clone(),
+            multiaddr,
+            onion_address: None,
+            i2p_address: None,
+        };
+
+        let value = match serde_json::to_vec(&node) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to serialise peer info for DHT: {}", e);
+                return;
+            }
+        };
+
+        let key_str = format!("/oarn/peer/{}", peer_id_str);
+        let key = kad::RecordKey::new(&key_str);
+
+        let record = kad::Record {
+            key,
+            value,
+            publisher: None,
+            expires: None,
+        };
+
+        match self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .put_record(record, kad::Quorum::One)
+        {
+            Ok(_) => info!("Publishing peer info to DHT"),
+            Err(e) => warn!("DHT put_record failed: {}", e),
+        }
+    }
+
+    /// Query the DHT for OARN peers published by other nodes.
+    ///
+    /// Fetches the shared `/oarn/peers/v1` directory record and each
+    /// per-node record `/oarn/peer/<peer_id>` that arrives via GetRecord
+    /// callbacks. Results are handled in `handle_kademlia_event`.
+    pub fn query_oarn_peers(&mut self) {
+        let dir_key = kad::RecordKey::new(b"/oarn/peers/v1");
+        self.swarm.behaviour_mut().kademlia.get_record(dir_key);
+        debug!("DHT: querying OARN peer records");
     }
 
     /// Add a peer address to the DHT
