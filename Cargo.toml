@@ -98,6 +98,8 @@ mockall = "0.12"
 [features]
 default = []
 compute = ["dep:ort", "dep:ndarray"]  # ONNX inference — requires glibc 2.38+
+cuda  = ["compute", "ort/cuda"]       # NVIDIA GPU via ONNX Runtime CUDA EP
+rocm  = ["compute", "ort/rocm"]       # AMD GPU via ONNX Runtime ROCm EP
 tor = [] # Enable when arti is added
 
 [[bin]]

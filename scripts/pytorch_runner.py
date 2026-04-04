@@ -19,12 +19,13 @@ try:
 except Exception:
     values, shape = [0.0], [1, 1]
 
-model = torch.jit.load(model_path, map_location='cpu')
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = torch.jit.load(model_path, map_location=device)
 model.eval()
 with torch.no_grad():
-    t = torch.tensor(values, dtype=torch.float32).reshape(shape)
+    t = torch.tensor(values, dtype=torch.float32).reshape(shape).to(device)
     out = model(t)
-    out_list = out.flatten().tolist()
+    out_list = out.cpu().flatten().tolist()
     out_shape = list(out.shape)
 
 print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='')

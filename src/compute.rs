@@ -21,6 +21,36 @@ use crate::batch::{
 use crate::blockchain::TaskInfo;
 use crate::config::Config;
 
+/// GPU backend detected at node startup
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuBackend {
+    /// NVIDIA GPU detected via nvidia-smi; vram_mb is the first GPU's total VRAM
+    Nvidia { vram_mb: u64 },
+    /// AMD GPU detected via rocm-smi; vram_mb is the first GPU's total VRAM
+    AMD { vram_mb: u64 },
+    /// No GPU found — execution falls back to CPU
+    None,
+}
+
+impl GpuBackend {
+    pub fn is_available(&self) -> bool {
+        !matches!(self, GpuBackend::None)
+    }
+    pub fn vram_mb(&self) -> Option<u64> {
+        match self {
+            GpuBackend::Nvidia { vram_mb } | GpuBackend::AMD { vram_mb } => Some(*vram_mb),
+            GpuBackend::None => None,
+        }
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            GpuBackend::Nvidia { .. } => "NVIDIA (CUDA)",
+            GpuBackend::AMD { .. } => "AMD (ROCm)",
+            GpuBackend::None => "CPU only",
+        }
+    }
+}
+
 /// Supported inference frameworks
 #[derive(Debug, Clone, PartialEq)]
 pub enum Framework {
@@ -134,6 +164,8 @@ pub struct ComputeEngine {
     max_ram_mb: Option<u64>,
     concurrent_tasks: usize,
     active_tasks: usize,
+    /// GPU backend detected at startup; used for execution-provider selection
+    gpu_backend: GpuBackend,
 }
 
 impl ComputeEngine {
@@ -151,10 +183,12 @@ impl ComputeEngine {
 
         // Detect available resources
         let (detected_vram, detected_ram) = detect_resources();
+        let gpu_backend = detect_gpu_backend();
 
         let max_vram_mb = config.compute.max_vram_mb.or(detected_vram);
         let max_ram_mb = config.compute.max_ram_mb.or(detected_ram);
 
+        info!("GPU backend: {}", gpu_backend.name());
         if let Some(vram) = max_vram_mb {
             info!("Available VRAM: {} MB", vram);
         }
@@ -168,6 +202,7 @@ impl ComputeEngine {
             max_ram_mb,
             concurrent_tasks: config.compute.concurrent_tasks,
             active_tasks: 0,
+            gpu_backend,
         })
     }
 
@@ -253,6 +288,30 @@ impl ComputeEngine {
         }
     }
 
+    /// Build an ONNX Runtime SessionBuilder pre-configured with the best available
+    /// execution provider.  GPU EPs are registered when the `cuda` / `rocm` Cargo
+    /// features are enabled; the runtime silently falls back to CPU if the EP is
+    /// not present in the linked ONNX Runtime binary.
+    #[cfg(feature = "compute")]
+    fn onnx_session_builder() -> Result<ort::session::SessionBuilder> {
+        let builder = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?;
+
+        #[cfg(feature = "cuda")]
+        let builder = {
+            use ort::execution_providers::CUDAExecutionProvider;
+            builder.with_execution_providers([CUDAExecutionProvider::default().build()])?
+        };
+
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        let builder = {
+            use ort::execution_providers::ROCmExecutionProvider;
+            builder.with_execution_providers([ROCmExecutionProvider::default().build()])?
+        };
+
+        Ok(builder)
+    }
+
     #[cfg(feature = "compute")]
     async fn execute_onnx_file(
         &self,
@@ -262,8 +321,7 @@ impl ComputeEngine {
         info!("Loading ONNX model from {:?}", model_path);
 
         // Load the ONNX model
-        let mut session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+        let mut session = Self::onnx_session_builder()?
             .commit_from_file(model_path)
             .context("Failed to load ONNX model")?;
 
@@ -533,12 +591,13 @@ try:
 except Exception:
     values, shape = [0.0], [1, 1]
 
-model = torch.jit.load(model_path, map_location='cpu')
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = torch.jit.load(model_path, map_location=device)
 model.eval()
 with torch.no_grad():
-    t = torch.tensor(values, dtype=torch.float32).reshape(shape)
+    t = torch.tensor(values, dtype=torch.float32).reshape(shape).to(device)
     out = model(t)
-    out_list = out.flatten().tolist()
+    out_list = out.cpu().flatten().tolist()
     out_shape = list(out.shape)
 
 print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='')
@@ -666,6 +725,7 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
             max_tasks: self.concurrent_tasks,
             vram_available_mb: self.max_vram_mb,
             ram_available_mb: self.max_ram_mb,
+            gpu_backend: self.gpu_backend.clone(),
         }
     }
 
@@ -845,8 +905,7 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
         );
 
         // Load the ONNX model from memory
-        let mut session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+        let mut session = Self::onnx_session_builder()?
             .commit_from_memory(model_data)
             .context("Failed to load ONNX model from memory")?;
 
@@ -1088,8 +1147,7 @@ print(json.dumps({"type": "f32", "shape": out_shape, "values": out_list}), end='
 
     #[cfg(feature = "compute")]
     fn execute_onnx_sync(&self, model_data: &[u8], input_data: &[u8]) -> Result<Vec<u8>> {
-        let mut session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+        let mut session = Self::onnx_session_builder()?
             .commit_from_memory(model_data)
             .context("Failed to load ONNX model")?;
 
@@ -1109,6 +1167,7 @@ pub struct ResourceUsage {
     pub max_tasks: usize,
     pub vram_available_mb: Option<u64>,
     pub ram_available_mb: Option<u64>,
+    pub gpu_backend: GpuBackend,
 }
 
 /// Detect available system resources
@@ -1119,10 +1178,20 @@ fn detect_resources() -> (Option<u64>, Option<u64>) {
     sys.refresh_memory();
     let ram_mb = Some(sys.total_memory() / (1024 * 1024)); // Convert bytes to MB
 
-    // VRAM detection via nvidia-smi (CUDA) or rocm-smi (ROCm)
-    let vram_mb = detect_vram_nvidia().or_else(detect_vram_rocm);
-
+    let vram_mb = detect_gpu_backend().vram_mb();
     (vram_mb, ram_mb)
+}
+
+/// Detect GPU backend by probing nvidia-smi then rocm-smi.
+/// Returns the first matching backend; `GpuBackend::None` if no GPU is found.
+fn detect_gpu_backend() -> GpuBackend {
+    if let Some(vram_mb) = detect_vram_nvidia() {
+        return GpuBackend::Nvidia { vram_mb };
+    }
+    if let Some(vram_mb) = detect_vram_rocm() {
+        return GpuBackend::AMD { vram_mb };
+    }
+    GpuBackend::None
 }
 
 /// Detect VRAM via nvidia-smi (CUDA GPUs).
