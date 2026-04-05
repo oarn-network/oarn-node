@@ -458,7 +458,8 @@ impl Discovery {
 
         let store = kad::store::MemoryStore::new(local_peer_id);
         let mut kad_config = kad::Config::default();
-        kad_config.set_record_ttl(Some(Duration::from_secs(3600)));
+        // 24-hour TTL matches network.rs — records stay alive between node restarts
+        kad_config.set_record_ttl(Some(Duration::from_secs(86400)));
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()

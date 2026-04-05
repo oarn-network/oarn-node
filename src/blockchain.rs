@@ -293,7 +293,7 @@ impl BlockchainClient {
             .unwrap()
             .as_secs();
 
-        info!("Current Unix time: {}", current_time);
+        debug!("Current Unix time: {}", current_time);
 
         for i in 1..=task_count.as_u64() {
             match contract.tasks(U256::from(i)).call().await {
@@ -302,14 +302,9 @@ impl BlockchainClient {
                     let status = task.9; // status field
                     let deadline = task.8.as_u64(); // deadline field
 
-                    info!(
-                        "Task #{}: status={}, deadline={}, current_time={}",
-                        i, status, deadline, current_time
-                    );
-
                     // Only include Pending (0) or Active (1) tasks that haven't expired
                     if (status == 0 || status == 1) && deadline > current_time {
-                        info!("Task #{} is available!", i);
+                        debug!("Task #{} is available", i);
                         result.push(TaskInfo {
                             id: task.0.as_u64(),
                             requester: task.1,
@@ -320,8 +315,8 @@ impl BlockchainClient {
                             deadline,
                         });
                     } else {
-                        info!(
-                            "Task #{} is NOT available (status={}, expired={})",
+                        debug!(
+                            "Task #{} skipped (status={}, expired={})",
                             i,
                             status,
                             deadline <= current_time

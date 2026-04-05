@@ -128,8 +128,8 @@ pub enum TasksSubcommand {
         #[arg(short, long, default_value = "3")]
         nodes: u32,
 
-        /// Deadline in hours from now (default: 24 hours)
-        #[arg(short, long, default_value = "24")]
+        /// Deadline in hours from now (default: 72 hours)
+        #[arg(short, long, default_value = "72")]
         deadline_hours: u64,
 
         /// Model requirements as JSON (e.g., '{"framework":"onnx","min_ram":"4GB"}')

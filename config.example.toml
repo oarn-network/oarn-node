@@ -10,7 +10,16 @@ connection_timeout = 30
 
 [network.discovery]
 method = "manual"
-# For testnet, we use manual discovery
+# Add the OARN bootstrap node so peer discovery works without relying on the
+# IPFS public DHT (which can be slow or unreachable on some networks).
+# The node running at 144.76.58.152 publishes its peer ID to the DHT, but
+# setting it here gives instant connectivity:
+#
+#   manual_bootstrap = ["/ip4/144.76.58.152/tcp/4001/p2p/<PEER_ID>"]
+#
+# Ask in Discord to get the current peer ID, or leave empty to rely on DHT.
+# Peer discovery failing with "0 closest peers" does NOT block task processing —
+# the node communicates with the blockchain directly via RPC.
 manual_bootstrap = []
 
 [blockchain]

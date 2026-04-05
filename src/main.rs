@@ -532,13 +532,13 @@ async fn poll_and_process_tasks(
     compute: &compute::ComputeEngine,
     wallet: &LocalWallet,
 ) -> Result<()> {
-    info!("Polling for available tasks...");
+    debug!("Polling for available V1 tasks...");
 
     // Get available tasks from blockchain
     let tasks = blockchain.get_available_tasks().await?;
 
     if tasks.is_empty() {
-        info!("No available tasks found");
+        debug!("No available V1 tasks (all expired or completed — submit a new one via the dashboard)");
         return Ok(());
     }
 

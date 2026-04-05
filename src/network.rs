@@ -96,8 +96,10 @@ impl P2PNetwork {
                 // Create Kademlia DHT with OARN protocol
                 let store = kad::store::MemoryStore::new(local_peer_id);
                 let mut kademlia_config = kad::Config::default();
-                // Set a longer record TTL for bootstrap info
-                kademlia_config.set_record_ttl(Some(Duration::from_secs(3600)));
+                // 24-hour TTL so peer records survive node restarts and brief outages.
+                // publish_peer_info() is called every 60s while a node is running,
+                // keeping the record fresh well within the TTL window.
+                kademlia_config.set_record_ttl(Some(Duration::from_secs(86400)));
                 kademlia_config.set_replication_interval(Some(Duration::from_secs(300)));
                 let kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
 
