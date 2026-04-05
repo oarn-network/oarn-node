@@ -115,6 +115,21 @@ async fn run_node(config: Config) -> Result<()> {
     let mut blockchain = blockchain::BlockchainClient::new(&config, &discovery).await?;
     info!("Connected to chain ID: {}", blockchain.chain_id());
 
+    // Fail fast if TaskRegistryV2 address is missing — the node cannot process
+    // any tasks without it and the error would otherwise surface as a confusing
+    // mid-run "contract not initialized" message.
+    if !blockchain.has_task_registry_v2() {
+        anyhow::bail!(
+            "Missing [blockchain.contracts] task_registry_v2 in config.\n\
+             Add the following to your ~/.oarn/config.toml:\n\n\
+             [blockchain.contracts]\n\
+             task_registry_v2 = \"0xD15530ce13188EE88E43Ab07EDD9E8729fCc55D0\"\n\
+             oarn_registry    = \"0xa122518Cb6E66A804fc37EB26c8a7aF309dCF04C\"\n\
+             token_reward     = \"0x24249A523A251E38CB0001daBd54DD44Ea8f1838\"\n\
+             gov_token        = \"0xB97eDD49C225d2c43e7203aB9248cAbED2B268d3\""
+        );
+    }
+
     // Step 3: Initialize P2P network
     info!("Initializing P2P network...");
     let mut network = network::P2PNetwork::new(&config, &discovery).await?;
