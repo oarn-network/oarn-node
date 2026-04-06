@@ -889,16 +889,17 @@ impl BlockchainClient {
         let event_tx = self.event_tx.clone();
         let ws_active = Arc::clone(&self.ws_active);
 
-        // Pre-compute event topic hashes once (these are compile-time constants).
-        let task_created_topic = ethers::core::abi::AbiParser::default()
-            .parse_event("TaskCreated(uint256 indexed taskId, address indexed requester, bytes32 modelHash, uint256 rewardPerNode, uint256 requiredNodes, uint8 consensusType)")
-            .expect("valid event sig")
-            .signature();
+        // Pre-compute event topic hashes from canonical signatures (no parameter names, no indexed).
+        // AbiParser does not support the `indexed` keyword in event strings.
+        let task_created_topic: ethers::core::types::H256 =
+            ethers::core::utils::keccak256(
+                "TaskCreated(uint256,address,bytes32,uint256,uint256,uint8)"
+            ).into();
 
-        let reward_topic = ethers::core::abi::AbiParser::default()
-            .parse_event("RewardDistributed(uint256 indexed taskId, address indexed node, uint256 amount, bool matchedConsensus)")
-            .expect("valid event sig")
-            .signature();
+        let reward_topic: ethers::core::types::H256 =
+            ethers::core::utils::keccak256(
+                "RewardDistributed(uint256,address,uint256,bool)"
+            ).into();
 
         tokio::spawn(async move {
             // Exponential backoff: starts at 2 s, doubles up to 64 s.
