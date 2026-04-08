@@ -87,21 +87,24 @@ impl IpfsStorage {
             info!("Fetching from local IPFS: {}", cid);
             use futures::TryStreamExt;
 
-            match self
+            let fetch_fut = self
                 .client
                 .cat(cid)
                 .map_ok(|chunk| chunk.to_vec())
-                .try_concat()
-                .await
-            {
-                Ok(data) => {
+                .try_concat();
+
+            match tokio::time::timeout(std::time::Duration::from_secs(30), fetch_fut).await {
+                Ok(Ok(data)) => {
                     // Cache the result
                     fs::write(&cache_path, &data).await?;
                     debug!("Cached CID: {}", cid);
                     return Ok(data);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("Local IPFS fetch failed: {}, trying public gateways...", e);
+                }
+                Err(_) => {
+                    warn!("Local IPFS fetch timed out for {}, trying public gateways...", cid);
                 }
             }
         }
@@ -286,13 +289,16 @@ impl IpfsStorage {
 /// This reconstructs a CIDv1 with raw codec (0x55) from the SHA-256 digest.
 /// The SDK uses cidToBytes32 to extract the digest, and this reverses that process.
 pub fn bytes32_to_cid(hash: &[u8; 32]) -> Result<String> {
-    // Create a SHA-256 multihash from the digest
-    // Multihash format: [code, length, ...digest]
+    // Reconstruct CIDv0 (Qm...) from the raw SHA-256 digest.
+    // cidToBytes32() in task-submitter.mjs strips the 0x1220 multihash header
+    // from a CIDv0 base58 string. We reverse that here: wrap as sha2-256
+    // multihash and create CIDv0 (dag-pb codec, base58btc), matching what
+    // IPFS uses for files uploaded via the standard add API.
     let multihash = Multihash::<64>::wrap(SHA2_256, hash)
         .map_err(|e| anyhow::anyhow!("Failed to create multihash: {}", e))?;
 
-    // Create CIDv1 with raw codec (0x55)
-    let cid = Cid::new_v1(0x55, multihash);
+    let cid = Cid::new_v0(multihash)
+        .map_err(|e| anyhow::anyhow!("Failed to create CIDv0: {}", e))?;
 
     Ok(cid.to_string())
 }
